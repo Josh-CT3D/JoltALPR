@@ -502,7 +502,7 @@ fun MainScreen(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Map tab — full-screen OSMDroid map with flagged pins
+// Map tab — full-screen OSMDroid map with flagged pins (Phase 4)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -510,69 +510,155 @@ fun JoltMapScreen(
     logs: List<DriverLog>,
     currentLocation: android.location.Location?
 ) {
-    JoltMapView(
-        modifier        = Modifier.fillMaxSize(),
-        logs            = logs,
-        currentLocation = currentLocation
-    )
+    // Hoist state so the re-center FAB can reset it
+    var mapViewRef    by remember { mutableStateOf<MapView?>(null) }
+    var userHasPanned by remember { mutableStateOf(false) }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+
+        JoltMapView(
+            modifier        = Modifier.fillMaxSize(),
+            logs            = logs,
+            currentLocation = currentLocation,
+            userHasPanned   = userHasPanned,
+            onUserPanned    = { userHasPanned = true },
+            onMapReady      = { mapViewRef = it }
+        )
+
+        // Empty-state hint (shown until the first flag is pressed)
+        if (logs.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 14.dp)
+                    .background(Color.Black.copy(alpha = 0.70f), RoundedCornerShape(8.dp))
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text      = "Pins appear here when you flag a driver on the Main tab",
+                    color     = Color.Gray,
+                    fontSize  = 11.sp,
+                    textAlign = TextAlign.Center,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        // Flagged-capture count badge (top-right)
+        if (logs.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(12.dp)
+                    .background(Color(0xFFFF1744), RoundedCornerShape(4.dp))
+                    .padding(horizontal = 10.dp, vertical = 4.dp)
+            ) {
+                Text(
+                    text       = "${logs.size} FLAGGED",
+                    color      = Color.White,
+                    fontSize   = 10.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        }
+
+        // Re-center FAB — snaps map back to current GPS after user panning
+        FloatingActionButton(
+            onClick = {
+                userHasPanned = false
+                currentLocation?.let { loc ->
+                    mapViewRef?.controller?.animateTo(GeoPoint(loc.latitude, loc.longitude))
+                }
+            },
+            modifier       = Modifier.align(Alignment.BottomEnd).padding(16.dp),
+            containerColor = Color(0xFF1565C0),
+            contentColor   = Color.White
+        ) {
+            Icon(Icons.Default.MyLocation, contentDescription = "Re-center map")
+        }
+    }
 }
 
 @Composable
 fun JoltMapView(
     modifier: Modifier,
     logs: List<DriverLog>,
-    currentLocation: android.location.Location?
+    currentLocation: android.location.Location?,
+    userHasPanned: Boolean,
+    onUserPanned: () -> Unit,
+    onMapReady: (MapView) -> Unit
 ) {
+    val context        = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    var mapViewRef by remember { mutableStateOf<MapView?>(null) }
-    // Once the user pans or zooms the map manually, stop snapping to GPS so the
-    // map doesn't fight them. Re-centers only until the first touch event.
-    var userHasPanned by remember { mutableStateOf(false) }
+    val dateFormat     = remember { SimpleDateFormat("MM/dd  HH:mm", Locale.getDefault()) }
 
-    // Honour MapView pause/resume with Activity lifecycle
+    // Programmatic red circle — used as the flagged-capture pin icon
+    val redPinDrawable = remember {
+        val dp  = context.resources.displayMetrics.density
+        val sz  = (dp * 28).toInt()
+        val bmp = android.graphics.Bitmap.createBitmap(sz, sz, android.graphics.Bitmap.Config.ARGB_8888)
+        val cvs = android.graphics.Canvas(bmp)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        paint.color = android.graphics.Color.parseColor("#FF1744")
+        cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp, paint)
+        paint.color = android.graphics.Color.WHITE
+        paint.style = android.graphics.Paint.Style.STROKE
+        paint.strokeWidth = dp * 2.5f
+        cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp * 2.5f, paint)
+        android.graphics.drawable.BitmapDrawable(context.resources, bmp)
+    }
+
+    // Honour MapView pause/resume with the Activity lifecycle
     DisposableEffect(lifecycleOwner) {
+        var latestMapView: MapView? = null
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> mapViewRef?.onResume()
-                Lifecycle.Event.ON_PAUSE  -> mapViewRef?.onPause()
+                Lifecycle.Event.ON_RESUME -> latestMapView?.onResume()
+                Lifecycle.Event.ON_PAUSE  -> latestMapView?.onPause()
                 else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            latestMapView?.onDetach()
+        }
     }
 
     AndroidView(
         factory = { ctx ->
             MapView(ctx).also { mapView ->
-                mapViewRef = mapView
                 mapView.setTileSource(TileSourceFactory.MAPNIK)
                 mapView.setMultiTouchControls(true)
                 mapView.controller.setZoom(15.0)
-                // Default center — will animate to real GPS when available
                 mapView.controller.setCenter(GeoPoint(37.7749, -122.4194))
                 mapView.setOnTouchListener { v, _ ->
-                    userHasPanned = true
+                    onUserPanned()
                     v.performClick()
-                    false // let OSMDroid handle the event normally
+                    false
                 }
+                onMapReady(mapView)
             }
         },
         update = { mapView ->
             mapView.overlays.clear()
-            val fmt = SimpleDateFormat("MM/dd HH:mm", Locale.getDefault())
 
-            // Red pins for every flagged capture
+            // Red circle pins for every flagged capture
+            // Tap a pin → OSMDroid shows the default info window with plate + time + battery
             logs.forEach { log ->
                 val marker = Marker(mapView).apply {
                     position = GeoPoint(log.latitude, log.longitude)
                     title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
-                    snippet  = fmt.format(Date(log.timestamp))
+                    snippet  = dateFormat.format(Date(log.timestamp)) +
+                               "  •  Battery ${log.batteryLevel}%"
+                    icon     = redPinDrawable
+                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 }
                 mapView.overlays.add(marker)
             }
 
-            // Follow GPS position until the user manually moves the map
+            // Follow GPS until the user pans away
             if (!userHasPanned) {
                 currentLocation?.let { loc ->
                     mapView.controller.animateTo(GeoPoint(loc.latitude, loc.longitude))

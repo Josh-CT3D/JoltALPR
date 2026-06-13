@@ -1,0 +1,46 @@
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/**/*.iml
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+
+# Gradle caches
+.gradle/
+build/
+
+# TFLite model files — large binaries, distribute separately
+# Comment these out if you want models in the repo
+android/app/src/main/assets/*.tflite
+
+# App signing keys — never commit
+*.jks
+*.keystore
+keystore.properties
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python training artifacts
+__pycache__/
+*.py[cod]
+*.pth
+*.onnx
+*.egg-info/
+dist/
+.venv/
+jolt-train/
+
+# Training data (large, sync via Google Drive instead)
+training_data/
+crops/
+
+# Misc
+*.log
+*.tmp

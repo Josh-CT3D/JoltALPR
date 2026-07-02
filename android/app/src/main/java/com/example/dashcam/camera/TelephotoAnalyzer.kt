@@ -252,9 +252,26 @@ class TelephotoAnalyzer(
     private fun registerAndVote(token: String): String? = synchronized(voteLock) {
         recentTokens.addLast(token)
         while (recentTokens.size > VOTE_WINDOW) recentTokens.removeFirst()
-        val best = recentTokens.groupingBy { it }.eachCount().maxByOrNull { it.value }
+        // Consensus = the most-voted token; ties are broken toward the more plate-plausible token
+        // (A17 scoring boost — vote count still dominates, nothing is hard-rejected).
+        val best = recentTokens.groupingBy { it }.eachCount().entries
+            .maxWithOrNull(compareBy({ it.value }, { plateFormatScore(it.key) }))
             ?: return@synchronized null
         if (best.value >= VOTE_MIN_COUNT) best.key else null
+    }
+
+    /**
+     * A17: loose US-plate plausibility, used only as a voting tiebreaker (never a hard filter).
+     * US formats vary wildly by state, so this stays permissive: it just declines to boost a
+     * token that's a run of digits with a single stray letter (e.g. "1234567X"), which is a rare
+     * real plate and a common OCR artifact. Returns 1 for plausible, 0 otherwise.
+     */
+    private fun plateFormatScore(token: String): Int {
+        val letters = token.count { it.isLetter() }
+        val digits  = token.count { it.isDigit() }
+        if (token.length !in 5..8 || letters == 0 || digits == 0) return 0
+        if (letters == 1 && digits >= 6) return 0
+        return 1
     }
 
     private fun resetVoteBuffer() = synchronized(voteLock) { recentTokens.clear() }

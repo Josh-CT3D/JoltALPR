@@ -84,8 +84,11 @@ dependencies {
     // Replaced: com.google.android.gms:play-services-mlkit-text-recognition
     implementation("com.google.mlkit:text-recognition:16.0.1")
 
-    // TensorFlow Lite — on-device YOLO inference (CPU, 4 threads — sufficient for 1fps on Pixel 10)
+    // TensorFlow Lite — on-device YOLO inference
+    // GPU delegate accelerates YOLO on the Pixel 10 Tensor G5 (falls back to CPU/4-threads if unavailable)
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
 
     // OSMDroid — offline map tiles, no API key required
     implementation("org.osmdroid:osmdroid-android:6.1.18")

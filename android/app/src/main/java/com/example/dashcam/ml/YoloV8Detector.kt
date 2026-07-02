@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -15,7 +16,7 @@ import kotlin.math.min
 
 /**
  * YOLOv8 TFLite detector for license plate detection.
- * Runs on CPU (4 threads) — sufficient for 1fps on Pixel 10 Tensor G5.
+ * Runs on the GPU delegate when available (Pixel 10 Tensor G5), falling back to CPU (4 threads).
  *
  * Model input:  [1, 640, 640, 3]  float32 RGB normalized to [0, 1]
  * Model output: [1, 5, 8400]      transposed format — rows are attributes, columns are anchors
@@ -31,6 +32,7 @@ class YoloV8Detector(private val context: Context) {
     )
 
     private var interpreter: Interpreter? = null
+    private var gpuDelegate: GpuDelegate? = null
     private val labels = listOf("license_plate")
 
     // Model input size (YOLOv8 typically uses 640x640)
@@ -41,20 +43,41 @@ class YoloV8Detector(private val context: Context) {
     fun initialize() {
         try {
             val modelBuffer = loadModelFile("yolov8_license_plate.tflite")
-
-            val options = Interpreter.Options().apply {
-                setNumThreads(4)
-            }
-
-            interpreter = Interpreter(modelBuffer, options)
-
-            Log.i(TAG, "YOLOv8 model loaded — CPU, 4 threads")
+            interpreter = createInterpreter(modelBuffer)
             Log.i(TAG, "Output shape: ${interpreter!!.getOutputTensor(0).shape().contentToString()}")
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize YOLOv8 detector: ${e.message}", e)
             throw e
         }
+    }
+
+    /**
+     * Build the interpreter, trying the GPU delegate first and falling back to CPU.
+     * The GPU path is wrapped fully (delegate creation AND Interpreter construction) because
+     * some devices don't fail at delegate creation — they fail late when the interpreter is
+     * built. Any failure cleans up the partial delegate and retries on CPU (4 threads).
+     */
+    private fun createInterpreter(modelBuffer: MappedByteBuffer): Interpreter {
+        try {
+            val delegate = GpuDelegate(GpuDelegate.Options().apply {
+                setPrecisionLossAllowed(true)
+            })
+            gpuDelegate = delegate
+            val gpuOptions = Interpreter.Options().apply { addDelegate(delegate) }
+            val gpuInterpreter = Interpreter(modelBuffer, gpuOptions)
+            Log.i(TAG, "GPU delegate enabled")
+            return gpuInterpreter
+        } catch (e: Exception) {
+            Log.w(TAG, "GPU delegate unavailable, CPU fallback: ${e.message}")
+            gpuDelegate?.close()
+            gpuDelegate = null
+        }
+
+        val cpuOptions = Interpreter.Options().apply { setNumThreads(4) }
+        val cpuInterpreter = Interpreter(modelBuffer, cpuOptions)
+        Log.i(TAG, "YOLOv8 model loaded — CPU, 4 threads")
+        return cpuInterpreter
     }
 
     /**
@@ -267,6 +290,8 @@ class YoloV8Detector(private val context: Context) {
     fun close() {
         interpreter?.close()
         interpreter = null
+        gpuDelegate?.close()
+        gpuDelegate = null
         Log.i(TAG, "YOLOv8 detector closed")
     }
 

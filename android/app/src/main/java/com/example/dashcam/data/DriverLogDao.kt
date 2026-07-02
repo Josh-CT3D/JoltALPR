@@ -24,12 +24,12 @@ interface DriverLogDao {
 
     /**
      * Known Bad Driver Alert lookup.
-     * Returns the most recent BAD-rated record matching this exact plate string,
-     * or null if the plate has never been flagged.
-     * Called every time the OCR pipeline produces a result (1 fps).
+     * Matches on the OCR-confusion-folded plate form (see normalizePlate) so O/0, I/1, B/8, S/5
+     * misreads still alert. Returns the most recent BAD-rated match, or null if never flagged.
+     * Called every time the OCR pipeline publishes a consensus plate.
      */
-    @Query("SELECT * FROM driver_logs WHERE plateOcr = :plateText AND rating = 'BAD' ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findBadDriverByPlate(plateText: String): DriverLog?
+    @Query("SELECT * FROM driver_logs WHERE plateNormalized = :normalizedPlate AND rating = 'BAD' ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findBadDriverByPlate(normalizedPlate: String): DriverLog?
 
     // --- Continuous GPS Breadcrumbs Location History ---
     @Insert(onConflict = OnConflictStrategy.REPLACE)

@@ -23,14 +23,17 @@ abstract class AppDatabase : RoomDatabase() {
         private var INSTANCE: AppDatabase? = null
 
         /**
-         * v4 -> v5: create the indices added in A8. Index names/columns match Room's generated
-         * schema (index_<table>_<cols>) so Room's post-migration validation passes. Data preserved.
+         * v4 -> v5: add the plateNormalized column (A16) and create the A8/A16 indices. Existing
+         * rows get a NULL plateNormalized (they simply won't match confusion-folded lookups until
+         * re-flagged). Index names/columns match Room's generated schema (index_<table>_<cols>) so
+         * Room's post-migration validation passes. Data preserved.
          */
         val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `plateNormalized` TEXT")
                 db.execSQL(
-                    "CREATE INDEX IF NOT EXISTS `index_driver_logs_plateOcr_rating` " +
-                        "ON `driver_logs` (`plateOcr`, `rating`)"
+                    "CREATE INDEX IF NOT EXISTS `index_driver_logs_plateNormalized_rating` " +
+                        "ON `driver_logs` (`plateNormalized`, `rating`)"
                 )
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_location_history_timestamp` " +

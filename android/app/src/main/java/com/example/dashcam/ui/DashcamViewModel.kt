@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.ct3d.jolt.data.AppDatabase
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.LocationRecord
+import com.ct3d.jolt.data.normalizePlate
 import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.data.safeInsertLog
 import com.ct3d.jolt.data.safeDeleteLog
@@ -161,7 +162,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
 
             viewModelScope.launch {
                 try {
-                    val match = dao.findBadDriverByPlate(plateOcr)
+                    val match = dao.findBadDriverByPlate(normalizePlate(plateOcr))
                     _knownBadDriverAlert.value = match
                     if (match != null) {
                         Log.w(TAG, "⚠️ KNOWN BAD DRIVER DETECTED: $plateOcr (previously flagged at ${match.timestamp})")
@@ -217,6 +218,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     id = 0,
                     rating = "BAD",
                     plateOcr = ocr,
+                    plateNormalized = ocr?.let { normalizePlate(it) },
                     vehicleMmc = if (ocr == null) mmc else null,
                     timestamp = System.currentTimeMillis(),
                     latitude = lat,

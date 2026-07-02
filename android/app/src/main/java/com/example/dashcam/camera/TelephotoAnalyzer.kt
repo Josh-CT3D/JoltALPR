@@ -19,7 +19,7 @@ import kotlinx.coroutines.launch
  * CameraX ImageAnalysis.Analyzer running at 1 FPS.
  *
  * Pipeline (Phase 2):
- *  1. YOLOv8 license-plate detection on the bottom 65% ROI of the frame
+ *  1. YOLOv8 license-plate detection on the full frame (A6: ROI crop removed — see below)
  *  2a. Plate found → ML Kit Text Recognition V2 → validate US plate regex → emit OCR string
  *  2b. No plate    → clear display (Option A: chip disappears)
  *
@@ -136,9 +136,12 @@ class TelephotoAnalyzer(
      * 3b. No plate    → clear display (Option A).
      */
     private suspend fun executeHybridMlPipeline(frameBitmap: Bitmap) {
-        // Use full frame — ROI crop removed so plates anywhere in frame are detected.
-        // The 35%-top crop was a dashcam optimization for sky removal; re-enable in Phase 7
-        // once we confirm the model works reliably in vehicle deployment.
+        // A6 decision: use the FULL frame — do not crop to a bottom ROI.
+        // The old bottom-65% ROI was a wide-angle-dashcam optimization to drop sky/buildings.
+        // With the 5× telephoto's tight FOV aimed at same-direction traffic, target plates
+        // routinely sit high in the frame (distant vehicles ahead), so cropping the top would cut
+        // them off — bad for detection rate (priority #2). After A1–A3, full-frame inference is
+        // fast enough that ROI's ~2.1× area saving is unnecessary. cropRoi() deleted as dead code.
         val roiBitmap = frameBitmap
         try {
             _pipelineState.value = _pipelineState.value.copy(lastStatusMessage = "Scanning...")
@@ -233,17 +236,6 @@ class TelephotoAnalyzer(
                 det.box.right  / roiW,
                 det.box.bottom / roiH
             )
-        }
-    }
-
-    /** Crop to lower 65% of the frame — removes sky, trees, buildings from inference. */
-    private fun cropRoi(bitmap: Bitmap): Bitmap {
-        val topOffset = (bitmap.height * 0.35f).toInt()
-        val roiHeight = bitmap.height - topOffset
-        return if (roiHeight > 0) {
-            Bitmap.createBitmap(bitmap, 0, topOffset, bitmap.width, roiHeight)
-        } else {
-            bitmap
         }
     }
 

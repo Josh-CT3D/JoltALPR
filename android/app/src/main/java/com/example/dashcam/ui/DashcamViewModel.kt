@@ -229,7 +229,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                 val tag = ocr ?: mmc ?: "Unidentified Vehicle"
                 val latStr = String.format("%.5f", lat)
                 val lonStr = String.format("%.5f", lon)
-                _notificationMessage.value = "Flagged: $tag  |  GPS: [$latStr, $lonStr]  |  Bat: $battery%"
+                _notificationMessage.value = "Flagged: $tag  |  GPS: [$latStr, $lonStr]  |  Bat: ${BatteryMonitor.format(battery)}"
                 Log.i(TAG, "Flagged bad driver [Row: $rowId, Tag: $tag, GPS: $lat/$lon, Battery: $battery%]")
             } catch (e: Exception) {
                 Log.e(TAG, "FLAG BUTTON — DB write failed: ${e.localizedMessage}", e)

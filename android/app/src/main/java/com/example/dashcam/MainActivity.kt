@@ -655,7 +655,7 @@ fun JoltMapView(
                     position = GeoPoint(log.latitude, log.longitude)
                     title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
                     snippet  = dateFormat.format(Date(log.timestamp)) +
-                               "  •  Battery ${log.batteryLevel}%"
+                               "  •  Battery ${com.ct3d.jolt.service.BatteryMonitor.format(log.batteryLevel)}"
                     icon     = redPinDrawable
                     setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 }

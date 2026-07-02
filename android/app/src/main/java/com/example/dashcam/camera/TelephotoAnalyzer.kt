@@ -92,7 +92,13 @@ class TelephotoAnalyzer(
         val bitmap = try {
             val raw = image.toRgbaBitmap()
             image.close()
-            if (rotationDegrees != 0) raw.rotate(rotationDegrees.toFloat()) else raw
+            if (rotationDegrees != 0) {
+                val rotated = raw.rotate(rotationDegrees.toFloat())
+                raw.recycle() // A4(a): pre-rotation frame is dead once rotate() copies it
+                rotated
+            } else {
+                raw
+            }
         } catch (e: Exception) {
             image.close()
             Log.e(TAG, "Frame decode failed: ${e.localizedMessage}", e)
@@ -134,44 +140,76 @@ class TelephotoAnalyzer(
         // The 35%-top crop was a dashcam optimization for sky removal; re-enable in Phase 7
         // once we confirm the model works reliably in vehicle deployment.
         val roiBitmap = frameBitmap
+        try {
+            _pipelineState.value = _pipelineState.value.copy(lastStatusMessage = "Scanning...")
+            val detections = runYoloDetection(roiBitmap)
+            Log.d(TAG, "YOLO: ${detections.size} plate detections (threshold 0.25)")
 
-        _pipelineState.value = _pipelineState.value.copy(lastStatusMessage = "Scanning...")
-        val detections = runYoloDetection(roiBitmap)
-        Log.d(TAG, "YOLO: ${detections.size} plate detections (threshold 0.25)")
+            val bestPlate = detections.filter { it.confidence > 0.25f }
+                                      .maxByOrNull { it.confidence }
 
-        val bestPlate = detections.filter { it.confidence > 0.25f }
-                                  .maxByOrNull { it.confidence }
+            if (bestPlate != null) {
+                val fractionalBoxes = computeFractionalBoxes(
+                    detections.filter { it.confidence > 0.25f }, roiBitmap
+                )
+                _pipelineState.value = _pipelineState.value.copy(
+                    plateBoxes = fractionalBoxes,
+                    lastStatusMessage = "Plate found — running OCR..."
+                )
 
-        if (bestPlate != null) {
-            val fractionalBoxes = computeFractionalBoxes(
-                detections.filter { it.confidence > 0.25f }, roiBitmap
-            )
-            _pipelineState.value = _pipelineState.value.copy(
-                plateBoxes = fractionalBoxes,
-                lastStatusMessage = "Plate found — running OCR..."
-            )
+                Log.d(TAG, "Best plate box: left=${bestPlate.box.left} top=${bestPlate.box.top} " +
+                           "right=${bestPlate.box.right} bottom=${bestPlate.box.bottom} " +
+                           "conf=${bestPlate.confidence}  ROI=${roiBitmap.width}×${roiBitmap.height}")
+                val plateCrop = cropBitmapToDetection(roiBitmap, bestPlate.box)
+                if (plateCrop != null) {
+                    trainingCallback?.invoke(roiBitmap, bestPlate.box) // Phase 6 hook (synchronous)
 
-            Log.d(TAG, "Best plate box: left=${bestPlate.box.left} top=${bestPlate.box.top} " +
-                       "right=${bestPlate.box.right} bottom=${bestPlate.box.bottom} " +
-                       "conf=${bestPlate.confidence}  ROI=${roiBitmap.width}×${roiBitmap.height}")
-            val plateCrop = cropBitmapToDetection(roiBitmap, bestPlate.box)
-            if (plateCrop != null) {
-                trainingCallback?.invoke(roiBitmap, bestPlate.box) // Phase 6 hook
-                runMlKitOcr(plateCrop)
-                // Persist upscaled crop in pipeline state so ViewModel can save it on FLAG press
-                val minDim = 128
-                val scaled = if (plateCrop.width < minDim || plateCrop.height < minDim) {
-                    val scale = maxOf(minDim.toFloat() / plateCrop.width, minDim.toFloat() / plateCrop.height)
-                    Bitmap.createScaledBitmap(plateCrop, (plateCrop.width * scale).toInt().coerceAtLeast(minDim), (plateCrop.height * scale).toInt().coerceAtLeast(minDim), true)
-                } else plateCrop
-                _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = scaled)
+                    // Two independent upscaled copies: one owned by OCR (recycled in the ML Kit
+                    // callback), one persisted for FLAG-save. Keeping them separate means recycling
+                    // one never pulls the pixels out from under the other.
+                    val ocrCrop = upscaleCrop(plateCrop)
+                    val persistCrop = upscaleCrop(plateCrop)
+                    plateCrop.recycle() // A4(c): raw crop is consumed once both upscales are made
+
+                    // Publish the persisted crop and recycle the one it replaces. Its other owner is
+                    // the ViewModel, which only reads it synchronously on FLAG press (>=1 frame apart).
+                    val previousCrop = _pipelineState.value.lastPlateCrop
+                    _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = persistCrop)
+                    if (previousCrop != null && previousCrop !== persistCrop && !previousCrop.isRecycled) {
+                        previousCrop.recycle()
+                    }
+
+                    runMlKitOcr(ocrCrop) // takes ownership of ocrCrop
+                } else {
+                    Log.w(TAG, "Plate crop null — clearing display.")
+                    clearDetectionState()
+                }
             } else {
-                Log.w(TAG, "Plate crop null — clearing display.")
+                Log.d(TAG, "No plate detected — clearing display (Option A).")
                 clearDetectionState()
             }
+        } finally {
+            // A4(b): the full frame is fully consumed here — YOLO copies it into its own scratch
+            // bitmap, crops are taken synchronously — so recycle it every path to stop frames
+            // piling up over multi-hour drives. (roiBitmap === frameBitmap while ROI crop is off.)
+            if (!frameBitmap.isRecycled) frameBitmap.recycle()
+        }
+    }
+
+    /**
+     * Upscale a plate crop to ML Kit's ~128px minimum, ALWAYS returning a new bitmap the caller
+     * owns — so the source crop can be recycled without affecting the result, and the OCR copy and
+     * the persisted copy are independent bitmaps.
+     */
+    private fun upscaleCrop(src: Bitmap, minDim: Int = 128): Bitmap {
+        return if (src.width < minDim || src.height < minDim) {
+            val scale = maxOf(minDim.toFloat() / src.width, minDim.toFloat() / src.height)
+            val newW = (src.width * scale).toInt().coerceAtLeast(minDim)
+            val newH = (src.height * scale).toInt().coerceAtLeast(minDim)
+            Log.d(TAG, "Upscaling plate crop ${src.width}×${src.height} → ${newW}×${newH}")
+            Bitmap.createScaledBitmap(src, newW, newH, true)
         } else {
-            Log.d(TAG, "No plate detected — clearing display (Option A).")
-            clearDetectionState()
+            src.copy(src.config ?: Bitmap.Config.ARGB_8888, false)
         }
     }
 
@@ -209,20 +247,17 @@ class TelephotoAnalyzer(
         }
     }
 
+    /**
+     * Runs ML Kit OCR on an already-upscaled plate crop. Takes ownership of [plateBitmap]: ML Kit
+     * reads it asynchronously, so it must not be recycled until the task completes — the
+     * completion listener recycles it (covers both success and failure).
+     */
     private fun runMlKitOcr(plateBitmap: Bitmap) {
-        // ML Kit requires minimum 32×32; upscale small crops so OCR has enough pixels to work with.
-        val minDim = 128
-        val scaledBitmap = if (plateBitmap.width < minDim || plateBitmap.height < minDim) {
-            val scale = maxOf(minDim.toFloat() / plateBitmap.width, minDim.toFloat() / plateBitmap.height)
-            val newW = (plateBitmap.width * scale).toInt().coerceAtLeast(minDim)
-            val newH = (plateBitmap.height * scale).toInt().coerceAtLeast(minDim)
-            Log.d(TAG, "Upscaling plate crop ${plateBitmap.width}×${plateBitmap.height} → ${newW}×${newH}")
-            Bitmap.createScaledBitmap(plateBitmap, newW, newH, true)
-        } else {
-            plateBitmap
-        }
-        val inputImage = InputImage.fromBitmap(scaledBitmap, 0)
+        val inputImage = InputImage.fromBitmap(plateBitmap, 0)
         ocrRecognizer.process(inputImage)
+            .addOnCompleteListener {
+                if (!plateBitmap.isRecycled) plateBitmap.recycle()
+            }
             .addOnSuccessListener { visionText ->
                 val raw = visionText.text.trim().replace("\n", " ")
                 if (raw.isNotEmpty()) {

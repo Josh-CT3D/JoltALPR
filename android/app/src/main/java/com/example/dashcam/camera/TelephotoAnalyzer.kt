@@ -60,6 +60,14 @@ class TelephotoAnalyzer(
     private var lastAnalyzedTimestamp = 0L
     private val frameDispatcher = Dispatchers.Default
 
+    // A15: multi-frame OCR voting. A single ML Kit misread (LT2379 -> LT2879) must not immediately
+    // become the active plate and fire a false known-bad-driver alert. We keep a rolling window of
+    // the last VOTE_WINDOW token reads and only publish a token once it has appeared at least
+    // VOTE_MIN_COUNT times. Guarded by voteLock because reads happen on the ML Kit callback thread
+    // while resets happen on the pipeline dispatcher.
+    private val voteLock = Any()
+    private val recentTokens = ArrayDeque<String>()
+
     // Phase 6: set this callback to receive (fullFrameBitmap, plateBox) for training data collection
     var trainingCallback: ((Bitmap, RectF) -> Unit)? = null
 
@@ -199,6 +207,7 @@ class TelephotoAnalyzer(
                 }
             } else {
                 Log.d(TAG, "No plate detected — clearing display (Option A).")
+                resetVoteBuffer() // plate left frame — start voting fresh for the next one
                 clearDetectionState()
             }
         } finally {
@@ -234,6 +243,21 @@ class TelephotoAnalyzer(
             lastStatusMessage = "Scanning..."
         )
     }
+
+    /**
+     * A15: add a token to the rolling vote window and return the consensus token — the most
+     * frequent token in the window, but only once it has appeared at least VOTE_MIN_COUNT times.
+     * Returns null while no token has enough agreement yet.
+     */
+    private fun registerAndVote(token: String): String? = synchronized(voteLock) {
+        recentTokens.addLast(token)
+        while (recentTokens.size > VOTE_WINDOW) recentTokens.removeFirst()
+        val best = recentTokens.groupingBy { it }.eachCount().maxByOrNull { it.value }
+            ?: return@synchronized null
+        if (best.value >= VOTE_MIN_COUNT) best.key else null
+    }
+
+    private fun resetVoteBuffer() = synchronized(voteLock) { recentTokens.clear() }
 
     /** Map detection boxes from frame pixel space to fractions (0.0–1.0) for the UI overlay. */
     private fun computeFractionalBoxes(detections: List<Detection>, roiBitmap: Bitmap): List<PlateBox> {
@@ -274,12 +298,23 @@ class TelephotoAnalyzer(
                         token.any { it.isLetter() }
                     }
                     if (plateToken != null) {
-                        Log.i(TAG, "OCR success: '$plateToken'  (full read: '$clean')")
-                        _pipelineState.value = _pipelineState.value.copy(
-                            activePlateocr    = plateToken,
-                            activeVehicleMmc  = null,
-                            lastStatusMessage = "OCR: $plateToken"
-                        )
+                        // A15: only publish once the token wins a vote across recent frames.
+                        val consensus = registerAndVote(plateToken)
+                        if (consensus != null) {
+                            Log.i(TAG, "OCR consensus: '$consensus'  (this read: '$plateToken', full: '$clean')")
+                            _pipelineState.value = _pipelineState.value.copy(
+                                activePlateocr    = consensus,
+                                activeVehicleMmc  = null,
+                                lastStatusMessage = "OCR: $consensus"
+                            )
+                        } else {
+                            // Accepted into the vote window but not yet confirmed — don't touch
+                            // activePlateocr (prevents a single misread firing a known-bad alert).
+                            Log.d(TAG, "OCR pending consensus: '$plateToken' (full: '$clean')")
+                            _pipelineState.value = _pipelineState.value.copy(
+                                lastStatusMessage = "OCR (confirming): $plateToken"
+                            )
+                        }
                     } else {
                         Log.w(TAG, "OCR '$clean' — no plate-like token found, clearing display.")
                         clearDetectionState()
@@ -404,5 +439,10 @@ class TelephotoAnalyzer(
          * feed A15's multi-frame OCR voting more samples per pass.
          */
         const val ANALYSIS_INTERVAL_MS = 500L
+
+        // A15 OCR voting: publish a token only after it appears >=VOTE_MIN_COUNT times within the
+        // last VOTE_WINDOW reads. Higher analysis rates (A5) fill this window faster.
+        private const val VOTE_WINDOW = 5
+        private const val VOTE_MIN_COUNT = 2
     }
 }

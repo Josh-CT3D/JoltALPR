@@ -518,6 +518,12 @@ fun JoltMapScreen(
     var mapViewRef    by remember { mutableStateOf<MapView?>(null) }
     var userHasPanned by remember { mutableStateOf(false) }
 
+    // Drop the MapView reference when this screen leaves composition so we don't retain a
+    // detached OSMDroid view.
+    DisposableEffect(Unit) {
+        onDispose { mapViewRef = null }
+    }
+
     Box(modifier = Modifier.fillMaxSize()) {
 
         JoltMapView(
@@ -613,20 +619,24 @@ fun JoltMapView(
         android.graphics.drawable.BitmapDrawable(context.resources, bmp)
     }
 
+    // Holds the live MapView so the lifecycle observer below can actually pause/resume/detach it.
+    // (Previously a local var that was never assigned, so onResume/onPause/onDetach were no-ops.)
+    val mapViewHolder = remember { mutableStateOf<MapView?>(null) }
+
     // Honour MapView pause/resume with the Activity lifecycle
     DisposableEffect(lifecycleOwner) {
-        var latestMapView: MapView? = null
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> latestMapView?.onResume()
-                Lifecycle.Event.ON_PAUSE  -> latestMapView?.onPause()
+                Lifecycle.Event.ON_RESUME -> mapViewHolder.value?.onResume()
+                Lifecycle.Event.ON_PAUSE  -> mapViewHolder.value?.onPause()
                 else -> {}
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose {
             lifecycleOwner.lifecycle.removeObserver(observer)
-            latestMapView?.onDetach()
+            mapViewHolder.value?.onDetach()
+            mapViewHolder.value = null
         }
     }
 
@@ -642,6 +652,7 @@ fun JoltMapView(
                     v.performClick()
                     false
                 }
+                mapViewHolder.value = mapView
                 onMapReady(mapView)
             }
         },
@@ -1014,6 +1025,13 @@ fun CameraPreviewWidget(
     cameraProviderFuture: ListenableFuture<ProcessCameraProvider>,
     analyzer: TelephotoAnalyzer?
 ) {
+    // Backstop cleanup: the sensor listener is enabled/disabled on view attach/detach below, but
+    // also disable it when this composable leaves composition so the sensor never stays live.
+    val orientationListenerRef = remember { mutableStateOf<android.view.OrientationEventListener?>(null) }
+    DisposableEffect(Unit) {
+        onDispose { orientationListenerRef.value?.disable() }
+    }
+
     AndroidView(
         factory = { ctx ->
             val previewView = PreviewView(ctx)
@@ -1057,6 +1075,7 @@ fun CameraPreviewWidget(
                         }
                     }
 
+                    orientationListenerRef.value = orientationEventListener
                     previewView.addOnAttachStateChangeListener(object : android.view.View.OnAttachStateChangeListener {
                         override fun onViewAttachedToWindow(v: android.view.View)  { orientationEventListener.enable() }
                         override fun onViewDetachedFromWindow(v: android.view.View) { orientationEventListener.disable() }

@@ -79,8 +79,8 @@ class TelephotoAnalyzer(
     override fun analyze(image: ImageProxy) {
         val currentMillis = System.currentTimeMillis()
 
-        // 1 FPS gate — release frame immediately if too soon
-        if (currentMillis - lastAnalyzedTimestamp < 1000L) {
+        // Analysis-rate gate — release frame immediately if too soon (see ANALYSIS_INTERVAL_MS)
+        if (currentMillis - lastAnalyzedTimestamp < ANALYSIS_INTERVAL_MS) {
             image.close()
             return
         }
@@ -390,5 +390,17 @@ class TelephotoAnalyzer(
 
     companion object {
         private const val TAG = "TelephotoAnalyzer"
+
+        /**
+         * Minimum gap between analyzed frames. 1000ms (1fps) was chosen for the old CPU
+         * pipeline's thermal safety; after A1–A4 (GPU delegate, direct RGBA conversion, buffer
+         * reuse, bitmap recycling) per-frame cost dropped several-fold, so we analyze faster to
+         * catch plates at highway closing speeds (a plate may be readable for well under a second).
+         *
+         * 500ms = 2fps. Drop toward 333ms (3fps) after the Phase 7 thermal test confirms the
+         * device stays below throttling at the mounted operating temperature. Higher rates also
+         * feed A15's multi-frame OCR voting more samples per pass.
+         */
+        const val ANALYSIS_INTERVAL_MS = 500L
     }
 }

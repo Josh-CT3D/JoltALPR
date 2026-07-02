@@ -1024,6 +1024,9 @@ fun CameraPreviewWidget(
                     }
 
                     val imageAnalysis = ImageAnalysis.Builder()
+                        // RGBA_8888 output lets the analyzer build a Bitmap straight from the
+                        // single plane buffer — no YUV→NV21→JPEG→RGB round-trip per frame.
+                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                         .build()
 

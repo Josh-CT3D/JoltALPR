@@ -2,10 +2,7 @@ package com.ct3d.jolt.camera
 
 import android.content.Context
 import android.graphics.*
-import android.media.Image
 import android.util.Log
-import androidx.annotation.OptIn
-import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.ct3d.jolt.ml.YoloV8Detector
@@ -17,7 +14,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import java.io.ByteArrayOutputStream
 
 /**
  * CameraX ImageAnalysis.Analyzer running at 1 FPS.
@@ -80,7 +76,6 @@ class TelephotoAnalyzer(
         val confidence: Float
     )
 
-    @OptIn(ExperimentalGetImage::class)
     override fun analyze(image: ImageProxy) {
         val currentMillis = System.currentTimeMillis()
 
@@ -91,17 +86,11 @@ class TelephotoAnalyzer(
         }
         lastAnalyzedTimestamp = currentMillis
 
-        val mediaImage = image.image ?: run {
-            Log.w(TAG, "Frame skipped: null media image payload.")
-            image.close()
-            return
-        }
-
         // Read ImageProxy metadata synchronously before closing, then close immediately.
         // CameraX requires ImageProxy to be closed on the analyzer thread before returning.
         val rotationDegrees = image.imageInfo.rotationDegrees
         val bitmap = try {
-            val raw = mediaImage.toBitmap()
+            val raw = image.toRgbaBitmap()
             image.close()
             if (rotationDegrees != 0) raw.rotate(rotationDegrees.toFloat()) else raw
         } catch (e: Exception) {
@@ -315,52 +304,35 @@ class TelephotoAnalyzer(
         } catch (e: Exception) { null }
     }
 
-    // YUV_420_888 → NV21 conversion. The U and V planes in YUV_420_888 are NOT guaranteed
-    // to be contiguous, so we must interleave V and U bytes manually to produce valid NV21
-    // (which is Y-plane followed by interleaved VU pairs). Concatenating the raw plane buffers
-    // produces corrupt green frames on most Pixel devices.
-    private fun Image.toBitmap(): Bitmap {
-        val yPlane = planes[0]
-        val uPlane = planes[1]
-        val vPlane = planes[2]
+    /**
+     * Convert an RGBA_8888 ImageProxy directly to a Bitmap.
+     *
+     * Requires ImageAnalysis to be configured with OUTPUT_IMAGE_FORMAT_RGBA_8888, which delivers
+     * a single interleaved RGBA plane. We copy that plane straight into an ARGB_8888 Bitmap —
+     * no NV21 interleave, no JPEG encode/decode round-trip (which cost ~10–20ms and several large
+     * allocations per frame on the old YUV path).
+     *
+     * The plane's rowStride may include right-edge padding; when it does we build a slightly wider
+     * bitmap then crop back to the real width (the padded temp is recycled since it never escapes).
+     */
+    private fun ImageProxy.toRgbaBitmap(): Bitmap {
+        val plane = planes[0]
+        val buffer = plane.buffer.apply { rewind() }
+        val pixelStride = plane.pixelStride
+        val rowStride = plane.rowStride
+        val rowPadding = rowStride - pixelStride * width
+        val paddedWidth = width + rowPadding / pixelStride
 
-        val yBuf = yPlane.buffer
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
+        val padded = Bitmap.createBitmap(paddedWidth, height, Bitmap.Config.ARGB_8888)
+        padded.copyPixelsFromBuffer(buffer)
 
-        val ySize = yBuf.remaining()
-        // Chroma planes are width/2 × height/2 — total chroma bytes = width*height/2
-        val chromaSize = width * height / 2
-
-        val nv21 = ByteArray(ySize + chromaSize)
-        yBuf.get(nv21, 0, ySize)
-
-        // Interleave V and U into NV21 VU pairs. pixelStride is typically 2 for the
-        // interleaved case (both U and V buffers point into the same underlying memory),
-        // but we handle pixelStride == 1 (planar) as well.
-        val vPixelStride = vPlane.pixelStride
-        val uPixelStride = uPlane.pixelStride
-        val vRowStride = vPlane.rowStride
-        val uRowStride = uPlane.rowStride
-        val vBytes = ByteArray(vBuf.remaining()).also { vBuf.get(it) }
-        val uBytes = ByteArray(uBuf.remaining()).also { uBuf.get(it) }
-
-        var dstIdx = ySize
-        val chromaHeight = height / 2
-        val chromaWidth  = width  / 2
-        for (row in 0 until chromaHeight) {
-            for (col in 0 until chromaWidth) {
-                val vIdx = row * vRowStride + col * vPixelStride
-                val uIdx = row * uRowStride + col * uPixelStride
-                nv21[dstIdx++] = vBytes[vIdx]
-                nv21[dstIdx++] = uBytes[uIdx]
-            }
+        return if (rowPadding == 0) {
+            padded
+        } else {
+            val cropped = Bitmap.createBitmap(padded, 0, 0, width, height)
+            padded.recycle()
+            cropped
         }
-
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, this.width, this.height, null)
-        val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, this.width, this.height), 95, out)
-        return BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size())
     }
 
     private fun Bitmap.rotate(degrees: Float): Bitmap {

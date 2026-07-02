@@ -817,6 +817,12 @@ fun ExportScreen(
     }
 }
 
+/** Quote a CSV text field and escape embedded quotes (RFC 4180); empty string for null. */
+private fun csvField(value: String?): String {
+    val v = value ?: return ""
+    return "\"" + v.replace("\"", "\"\"") + "\""
+}
+
 private fun exportToCsv(context: Context, logs: List<DriverLog>) {
     try {
         val ts       = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
@@ -828,10 +834,23 @@ private fun exportToCsv(context: Context, logs: List<DriverLog>) {
         val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
         uri?.let {
             context.contentResolver.openOutputStream(it)?.use { stream ->
-                stream.write("ID,Timestamp,Latitude,Longitude,PlateOCR,VehicleMMC,Rating,Battery\n".toByteArray())
+                stream.write(
+                    ("ID,Timestamp,Latitude,Longitude,PlateOCR,PlateNormalized,VehicleMMC," +
+                        "Rating,Battery,PlateCropPath\n").toByteArray()
+                )
                 logs.forEach { log ->
-                    val line = "${log.id},${log.timestamp},${log.latitude},${log.longitude}," +
-                               "${log.plateOcr ?: ""},${log.vehicleMmc ?: ""},${log.rating},${log.batteryLevel}\n"
+                    val line = listOf(
+                        log.id.toString(),
+                        log.timestamp.toString(),
+                        log.latitude.toString(),
+                        log.longitude.toString(),
+                        csvField(log.plateOcr),
+                        csvField(log.plateNormalized),
+                        csvField(log.vehicleMmc),
+                        log.rating,
+                        log.batteryLevel.toString(),
+                        csvField(log.plateCropPath)
+                    ).joinToString(",") + "\n"
                     stream.write(line.toByteArray())
                 }
             }

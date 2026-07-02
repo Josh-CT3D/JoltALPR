@@ -2,6 +2,9 @@ package com.ct3d.jolt.ml
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.Interpreter
@@ -39,12 +42,35 @@ class YoloV8Detector(private val context: Context) {
     private val inputSize = 640
     private val pixelSize = 3 // RGB
     private val imageStd = 255.0f // Normalize to [0, 1]
+    private val numAnchors = 8400 // columns in the [1, 5, 8400] output
 
+    // Reusable inference scratch buffers — allocated once in initialize() and overwritten each
+    // detect() call, avoiding ~7 MB of per-frame allocation (input ByteBuffer + pixel IntArray +
+    // 640x640 bitmap + output array). detect()/initialize()/close() are @Synchronized so these
+    // are never touched by two frames at once (the analyzer can dispatch pipeline coroutines on a
+    // multi-threaded pool, so serialization here is required, not just assumed).
+    private lateinit var inputBuffer: ByteBuffer
+    private lateinit var intValues: IntArray
+    private lateinit var outputBuffer: Array<Array<FloatArray>>
+    private lateinit var resizedBitmap: Bitmap
+    private lateinit var resizeCanvas: Canvas
+    private val resizeMatrix = Matrix()
+    private val resizePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
+    @Synchronized
     fun initialize() {
         try {
             val modelBuffer = loadModelFile("yolov8_license_plate.tflite")
             interpreter = createInterpreter(modelBuffer)
             Log.i(TAG, "Output shape: ${interpreter!!.getOutputTensor(0).shape().contentToString()}")
+
+            // Allocate reusable scratch buffers once (see field comment).
+            inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * pixelSize)
+                .order(ByteOrder.nativeOrder())
+            intValues = IntArray(inputSize * inputSize)
+            outputBuffer = Array(1) { Array(5) { FloatArray(numAnchors) } }
+            resizedBitmap = Bitmap.createBitmap(inputSize, inputSize, Bitmap.Config.ARGB_8888)
+            resizeCanvas = Canvas(resizedBitmap)
 
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize YOLOv8 detector: ${e.message}", e)
@@ -87,6 +113,7 @@ class YoloV8Detector(private val context: Context) {
      * @param bitmap Input image (any size - will be resized to 640x640)
      * @return List of Detection objects with bounding boxes and confidence scores
      */
+    @Synchronized
     fun detect(bitmap: Bitmap, confidenceThreshold: Float = 0.25f): List<Detection> {
         val tflite = interpreter ?: run {
             Log.w(TAG, "Interpreter not initialized")
@@ -94,12 +121,11 @@ class YoloV8Detector(private val context: Context) {
         }
 
         try {
-            val inputBuffer = preprocessImage(bitmap)
-
+            // Fill the reused input buffer in place; reuse the [1][5][8400] output array.
             // Output shape: [1, 5, 8400] — transposed YOLOv8 format
             // Dimension 1 = attribute index: 0=cx, 1=cy, 2=w, 3=h, 4=score
             // Dimension 2 = anchor index (8400 candidate boxes)
-            val outputBuffer = Array(1) { Array(5) { FloatArray(8400) } }
+            preprocessImage(bitmap)
 
             tflite.run(inputBuffer, outputBuffer)
 
@@ -123,24 +149,23 @@ class YoloV8Detector(private val context: Context) {
     }
 
     /**
-     * Preprocess bitmap for YOLOv8 input:
-     * 1. Resize to 640x640
-     * 2. Convert to RGB
-     * 3. Normalize to [0, 1]
-     * 4. Convert to ByteBuffer
+     * Preprocess bitmap into the reused inputBuffer for YOLOv8 input:
+     * 1. Scale the source into the reused 640x640 bitmap via Canvas/Matrix (no new bitmap alloc)
+     * 2. Read pixels into the reused IntArray
+     * 3. Rewind and refill the reused ByteBuffer with normalized RGB floats
+     *
+     * Must run under the detect() lock — it mutates shared scratch buffers.
      */
-    private fun preprocessImage(bitmap: Bitmap): ByteBuffer {
-        // Resize image
-        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, true)
+    private fun preprocessImage(bitmap: Bitmap) {
+        // Scale full source into the entire 640x640 target — every dst pixel is overwritten,
+        // so no need to clear the reused bitmap between frames.
+        resizeMatrix.reset()
+        resizeMatrix.setScale(inputSize.toFloat() / bitmap.width, inputSize.toFloat() / bitmap.height)
+        resizeCanvas.drawBitmap(bitmap, resizeMatrix, resizePaint)
 
-        // Allocate ByteBuffer for model input
-        val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * pixelSize)
-        inputBuffer.order(ByteOrder.nativeOrder())
-
-        // Extract pixel values and normalize
-        val intValues = IntArray(inputSize * inputSize)
         resizedBitmap.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
 
+        inputBuffer.rewind()
         var pixel = 0
         for (y in 0 until inputSize) {
             for (x in 0 until inputSize) {
@@ -152,8 +177,6 @@ class YoloV8Detector(private val context: Context) {
                 inputBuffer.putFloat((value and 0xFF) / imageStd)          // B
             }
         }
-
-        return inputBuffer
     }
 
     /**
@@ -287,11 +310,15 @@ class YoloV8Detector(private val context: Context) {
      * Release resources when done.
      * Call this when camera is stopped or app is destroyed.
      */
+    @Synchronized
     fun close() {
         interpreter?.close()
         interpreter = null
         gpuDelegate?.close()
         gpuDelegate = null
+        if (::resizedBitmap.isInitialized && !resizedBitmap.isRecycled) {
+            resizedBitmap.recycle()
+        }
         Log.i(TAG, "YOLOv8 detector closed")
     }
 

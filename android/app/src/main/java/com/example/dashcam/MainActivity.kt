@@ -55,7 +55,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import android.graphics.BitmapFactory
-import android.graphics.RectF
+import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.ui.DashcamViewModel
@@ -344,7 +344,7 @@ private fun RowScope.JoltNavItem(
 fun MainScreen(
     activeOcr: String?,
     activeMmc: String?,
-    plateBoxes: List<RectF>,
+    plateBoxes: List<PlateBox>,
     bannerNotification: String?,
     onDismissNotification: () -> Unit,
     onFlagBadDriver: () -> Unit,
@@ -697,7 +697,7 @@ fun HistoryScreen(logList: List<DriverLog>) {
             )
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(logList) { log -> DriverLogItemWidget(log = log) }
+                items(logList, key = { it.id }) { log -> DriverLogItemWidget(log = log) }
             }
         }
     }
@@ -1002,7 +1002,7 @@ fun DriverLogItemWidget(log: DriverLog) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun BoundingBoxOverlay(boxes: List<RectF>, modifier: Modifier = Modifier) {
+fun BoundingBoxOverlay(boxes: List<PlateBox>, modifier: Modifier = Modifier) {
     val green = JoltColors.bboxGreen
     Canvas(modifier = modifier) {
         boxes.forEach { box ->

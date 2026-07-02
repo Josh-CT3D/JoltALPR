@@ -3,7 +3,6 @@ package com.ct3d.jolt.ui
 import android.annotation.SuppressLint
 import android.app.Application
 import android.graphics.Bitmap
-import android.graphics.RectF
 import android.location.Location
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -11,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.ct3d.jolt.data.AppDatabase
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.LocationRecord
+import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.data.safeInsertLog
 import com.ct3d.jolt.data.safeDeleteLog
 import com.ct3d.jolt.data.safeClearAllLogs
@@ -63,8 +63,8 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     val activeVehicleMmc: StateFlow<String?> = _activeVehicleMmc
 
     // Plate bounding boxes (fractional 0–1 coords) for the camera preview overlay
-    private val _plateBoxes = MutableStateFlow<List<RectF>>(emptyList())
-    val plateBoxes: StateFlow<List<RectF>> = _plateBoxes
+    private val _plateBoxes = MutableStateFlow<List<PlateBox>>(emptyList())
+    val plateBoxes: StateFlow<List<PlateBox>> = _plateBoxes
 
     // Sticky OCR: holds the last confident plate read for 5s after it leaves frame,
     // so the FLAG button always captures the most recently seen plate.
@@ -142,7 +142,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     fun updateActiveDetection(
         plateOcr: String?,
         vehicleMmc: String?,
-        plateBoxes: List<RectF> = emptyList(),
+        plateBoxes: List<PlateBox> = emptyList(),
         plateCrop: Bitmap? = null
     ) {
         _activePlateOcr.value = plateOcr

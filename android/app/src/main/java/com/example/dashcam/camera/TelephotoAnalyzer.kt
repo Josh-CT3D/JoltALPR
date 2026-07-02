@@ -16,6 +16,15 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
+ * Immutable plate box in fractional (0..1) frame coordinates, drawn by the UI overlay.
+ *
+ * Replaces mutable android.graphics.RectF in UI/pipeline state: RectF is mutable, so Compose
+ * treats state containing it as unstable and recomposes the Main screen every frame. A data class
+ * of vals (all primitives) is inferred stable, so the overlay only recomposes when boxes change.
+ */
+data class PlateBox(val left: Float, val top: Float, val right: Float, val bottom: Float)
+
+/**
  * CameraX ImageAnalysis.Analyzer running at 1 FPS.
  *
  * Pipeline (Phase 2):
@@ -38,8 +47,9 @@ class TelephotoAnalyzer(
         val processingTimeMs: Long = 0,
         val lastStatusMessage: String = "Pipeline Idle",
         // Plate boxes as fractions of the full camera frame (0.0–1.0).
-        // The UI draws green overlay rectangles from these.
-        val plateBoxes: List<RectF> = emptyList(),
+        // The UI draws green overlay rectangles from these. Immutable PlateBox (not RectF) keeps
+        // this state Compose-stable so the Main screen doesn't recompose every frame.
+        val plateBoxes: List<PlateBox> = emptyList(),
         // Most recent successful plate crop bitmap (upscaled). Null when no plate in view.
         val lastPlateCrop: Bitmap? = null
     )
@@ -226,11 +236,11 @@ class TelephotoAnalyzer(
     }
 
     /** Map detection boxes from frame pixel space to fractions (0.0–1.0) for the UI overlay. */
-    private fun computeFractionalBoxes(detections: List<Detection>, roiBitmap: Bitmap): List<RectF> {
+    private fun computeFractionalBoxes(detections: List<Detection>, roiBitmap: Bitmap): List<PlateBox> {
         val roiW = roiBitmap.width.toFloat()
         val roiH = roiBitmap.height.toFloat()
         return detections.map { det ->
-            RectF(
+            PlateBox(
                 det.box.left   / roiW,
                 det.box.top    / roiH,
                 det.box.right  / roiW,

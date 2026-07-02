@@ -9,7 +9,7 @@ import androidx.room.RoomDatabase
 /**
  * Singleton database wrapper over SQLite.
  */
-@Database(entities = [DriverLog::class, LocationRecord::class], version = 4, exportSchema = false)
+@Database(entities = [DriverLog::class, LocationRecord::class], version = 5, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun driverLogDao(): DriverLogDao
 

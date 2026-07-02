@@ -140,6 +140,11 @@ class MainActivity : ComponentActivity() {
         Log.i(TAG, "Initializing ALPR pipeline analyzer...")
         try {
             telephotoAnalyzer = TelephotoAnalyzer(applicationContext, lifecycleScope).also { analyzer ->
+                // A19: feed high-confidence detections to the training collector, but only while
+                // training mode is on (checked here so we don't have to swap the callback).
+                analyzer.trainingCallback = { frame, box ->
+                    if (viewModel.trainingModeEnabled.value) viewModel.onTrainingSample(frame, box)
+                }
                 lifecycleScope.launch {
                     analyzer.pipelineState.collect { state ->
                         viewModel.updateActiveDetection(
@@ -187,6 +192,8 @@ fun JoltApp(
     val gpsLocation        by viewModel.currentLocation.collectAsState()
     val bannerNotification by viewModel.notificationMessage.collectAsState()
     val badDriverAlert     by viewModel.knownBadDriverAlert.collectAsState()
+    val trainingMode       by viewModel.trainingModeEnabled.collectAsState()
+    val trainingCount      by viewModel.trainingSampleCount.collectAsState()
 
     // Wrap everything in a Box so the alert border can float above the Scaffold
     Box(modifier = Modifier.fillMaxSize()) {
@@ -226,7 +233,13 @@ fun JoltApp(
                     currentLocation = gpsLocation
                 )
                 2 -> HistoryScreen(logList = logList)
-                3 -> ExportScreen(logList = logList)
+                3 -> ExportScreen(
+                    logList          = logList,
+                    trainingMode     = trainingMode,
+                    trainingCount    = trainingCount,
+                    onToggleTraining = viewModel::toggleTrainingMode,
+                    onExportTraining = viewModel::exportTrainingData
+                )
                 4 -> ManageScreen(
                     logList     = logList,
                     onDeleteLog = viewModel::deleteLogItem,
@@ -708,7 +721,13 @@ fun HistoryScreen(logList: List<DriverLog>) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun ExportScreen(logList: List<DriverLog>) {
+fun ExportScreen(
+    logList: List<DriverLog>,
+    trainingMode: Boolean,
+    trainingCount: Int,
+    onToggleTraining: () -> Unit,
+    onExportTraining: () -> Unit
+) {
     val context = LocalContext.current
 
     Column(
@@ -747,26 +766,52 @@ fun ExportScreen(logList: List<DriverLog>) {
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        // Training data export card (Phase 6 — shown as informational for now)
+        // Training data collection + export card (Phase 6 / A19)
         Card(
             colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape    = RoundedCornerShape(10.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Column(modifier = Modifier.padding(16.dp)) {
+            Column(modifier = Modifier.padding(Dimens.spaceLg)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text       = "Training Data Collection",
+                        fontWeight = FontWeight.SemiBold,
+                        color      = Color.White,
+                        fontSize   = 14.sp
+                    )
+                    Switch(checked = trainingMode, onCheckedChange = { onToggleTraining() })
+                }
+                Spacer(modifier = Modifier.height(Dimens.spaceXs))
                 Text(
-                    text       = "Training Data Export",
-                    fontWeight = FontWeight.SemiBold,
-                    color      = Color.White,
-                    fontSize   = 14.sp
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text     = "Enable Training Mode (Phase 6) to collect annotated plate images.\n" +
-                               "Exports a Roboflow-compatible ZIP (images/ + labels/) for model fine-tuning.",
+                    text     = "When ON, confident plate detections are saved as annotated frames " +
+                               "(YOLO format) for model fine-tuning.",
                     color    = Color.Gray,
                     fontSize = 11.sp
                 )
+                Spacer(modifier = Modifier.height(Dimens.spaceMd))
+                Text(
+                    text       = "$trainingCount sample${if (trainingCount != 1) "s" else ""} collected",
+                    color      = Color.Gray,
+                    fontSize   = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Spacer(modifier = Modifier.height(Dimens.spaceSm))
+                Button(
+                    onClick  = onExportTraining,
+                    enabled  = trainingCount > 0,
+                    modifier = Modifier.fillMaxWidth().height(48.dp),
+                    colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
+                    shape    = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.FileDownload, contentDescription = null)
+                    Spacer(modifier = Modifier.width(Dimens.spaceSm))
+                    Text("Export Training ZIP", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                }
             }
         }
     }

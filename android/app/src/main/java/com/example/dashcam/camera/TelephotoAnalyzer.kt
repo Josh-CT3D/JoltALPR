@@ -183,7 +183,11 @@ class TelephotoAnalyzer(
                            "conf=${bestPlate.confidence}  ROI=${roiBitmap.width}×${roiBitmap.height}")
                 val plateCrop = cropBitmapToDetection(roiBitmap, bestPlate.box)
                 if (plateCrop != null) {
-                    trainingCallback?.invoke(roiBitmap, bestPlate.box) // Phase 6 hook (synchronous)
+                    // A19: collect high-confidence frames for training (callback no-ops if training
+                    // mode is off). Synchronous — completes before frameBitmap is recycled.
+                    if (bestPlate.confidence >= TRAINING_MIN_CONFIDENCE) {
+                        trainingCallback?.invoke(roiBitmap, bestPlate.box)
+                    }
 
                     // Two independent upscaled copies: one owned by OCR (recycled in the ML Kit
                     // callback), one persisted for FLAG-save. Keeping them separate means recycling
@@ -461,5 +465,8 @@ class TelephotoAnalyzer(
         // last VOTE_WINDOW reads. Higher analysis rates (A5) fill this window faster.
         private const val VOTE_WINDOW = 5
         private const val VOTE_MIN_COUNT = 2
+
+        // A19: only collect training frames from confident detections (cleaner labels).
+        private const val TRAINING_MIN_CONFIDENCE = 0.7f
     }
 }

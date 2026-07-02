@@ -3,6 +3,7 @@ package com.ct3d.jolt.ui
 import android.annotation.SuppressLint
 import android.app.Application
 import android.graphics.Bitmap
+import android.graphics.RectF
 import android.location.Location
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
@@ -18,10 +19,13 @@ import com.ct3d.jolt.data.safeClearAllLogs
 import com.ct3d.jolt.data.safeInsertLocationRecord
 import com.ct3d.jolt.data.safeClearAllLocationRecords
 import com.ct3d.jolt.service.BatteryMonitor
+import com.ct3d.jolt.training.TrainingDataCollector
 import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -41,6 +45,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val db = AppDatabase.getDatabase(application)
     private val dao = db.driverLogDao()
     private val batteryMonitor = BatteryMonitor(application)
+    private val trainingCollector = TrainingDataCollector(application)
 
     // Room Flows — all flagged capture records
     val logsList: StateFlow<List<DriverLog>> = dao.getAllLogs()
@@ -84,6 +89,10 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val _trainingModeEnabled = MutableStateFlow(false)
     val trainingModeEnabled: StateFlow<Boolean> = _trainingModeEnabled
 
+    // Count of collected training samples on disk (drives the Export tab label).
+    private val _trainingSampleCount = MutableStateFlow(0)
+    val trainingSampleCount: StateFlow<Int> = _trainingSampleCount
+
     /**
      * Known Bad Driver Alert.
      * Non-null when the current OCR plate matches a previously flagged BAD record in Room DB.
@@ -122,6 +131,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         fetchUpdatedLocation()
         startLocationUpdates()
         trimOldBreadcrumbs()
+        viewModelScope.launch {
+            _trainingSampleCount.value = withContext(Dispatchers.IO) { trainingCollector.sampleCount() }
+        }
     }
 
     private fun trimOldBreadcrumbs() {
@@ -245,6 +257,29 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         val state = if (_trainingModeEnabled.value) "ON" else "OFF"
         Log.i(TAG, "Training mode toggled: $state")
         _notificationMessage.value = "Training Mode: $state"
+    }
+
+    /**
+     * Called from TelephotoAnalyzer's training callback (only when training mode is on) for each
+     * high-confidence plate detection. Saves a frame + YOLO annotation. Runs on the analyzer's
+     * pipeline thread and must finish before the frame bitmap is recycled — onPlateDetected saves
+     * synchronously, so that holds.
+     */
+    fun onTrainingSample(frame: Bitmap, box: RectF) {
+        trainingCollector.onPlateDetected(frame, box)
+        _trainingSampleCount.value = _trainingSampleCount.value + 1
+    }
+
+    /** Zips collected training samples to Downloads/ (Roboflow/YOLO layout) for Google Drive sync. */
+    fun exportTrainingData() {
+        viewModelScope.launch {
+            val zipName = withContext(Dispatchers.IO) { trainingCollector.exportZipToDownloads() }
+            _notificationMessage.value = if (zipName != null) {
+                "Training data exported: Downloads/$zipName"
+            } else {
+                "No training data to export yet."
+            }
+        }
     }
 
     fun deleteLogItem(log: DriverLog) {

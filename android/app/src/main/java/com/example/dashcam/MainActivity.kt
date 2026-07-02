@@ -59,6 +59,7 @@ import android.graphics.RectF
 import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.ui.DashcamViewModel
+import com.ct3d.jolt.ui.theme.Dimens
 import com.ct3d.jolt.ui.theme.JoltColors
 import com.ct3d.jolt.ui.theme.JoltTheme
 import com.google.common.util.concurrent.ListenableFuture
@@ -274,7 +275,7 @@ fun PulsingAlertBorder(plate: String, onDismiss: () -> Unit) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .border(10.dp, JoltColors.alertYellow.copy(alpha = borderAlpha))
+                .border(Dimens.alertBorder, JoltColors.alertYellow.copy(alpha = borderAlpha))
         )
 
         // Warning card at top-center
@@ -690,14 +691,10 @@ fun HistoryScreen(logList: List<DriverLog>) {
             modifier   = Modifier.padding(bottom = 12.dp)
         )
         if (logList.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    text      = "No captures yet.\nFlag a bad driver on the main screen to see records here.",
-                    color     = Color.Gray,
-                    textAlign = TextAlign.Center,
-                    fontSize  = 13.sp
-                )
-            }
+            EmptyState(
+                icon = Icons.Default.List,
+                text = "No captures yet.\nFlag a bad driver on the Main tab to see records here."
+            )
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(logList) { log -> DriverLogItemWidget(log = log) }
@@ -854,9 +851,10 @@ fun ManageScreen(
         }
 
         if (logList.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text("No records to manage.", color = Color.Gray, fontSize = 13.sp)
-            }
+            EmptyState(
+                icon = Icons.Default.ManageSearch,
+                text = "No records to manage."
+            )
         } else {
             LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(logList, key = { it.id }) { log ->
@@ -905,8 +903,31 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Shared UI: history log item card
+// Shared UI: empty-state hint + history log item card
 // ─────────────────────────────────────────────────────────────────────────────
+
+/** Consistent full-screen empty state: centered gray icon + one-line hint (monospace). */
+@Composable
+fun EmptyState(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
+    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                imageVector        = icon,
+                contentDescription = null,
+                tint               = Color.Gray,
+                modifier           = Modifier.size(Dimens.emptyIcon)
+            )
+            Spacer(modifier = Modifier.height(Dimens.spaceMd))
+            Text(
+                text       = text,
+                color      = Color.Gray,
+                fontSize   = 13.sp,
+                textAlign  = TextAlign.Center,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+    }
+}
 
 @Composable
 fun DriverLogItemWidget(log: DriverLog) {

@@ -59,6 +59,8 @@ import android.graphics.RectF
 import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.ui.DashcamViewModel
+import com.ct3d.jolt.ui.theme.JoltColors
+import com.ct3d.jolt.ui.theme.JoltTheme
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.launch
 import org.osmdroid.config.Configuration
@@ -164,24 +166,7 @@ class MainActivity : ComponentActivity() {
     companion object { private const val TAG = "MainActivity" }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Theme
-// ─────────────────────────────────────────────────────────────────────────────
-
-@Composable
-fun JoltTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = darkColorScheme(
-            primary    = Color(0xFFFF1744), // Red — FLAG button accent
-            secondary  = Color(0xFF00E676), // Green — active detections
-            tertiary   = Color(0xFF00B0FF), // Blue — info / MMC
-            background = Color(0xFF0A0A0A),
-            surface    = Color(0xFF1A1A1A),
-            onSurface  = Color.White
-        ),
-        content = content
-    )
-}
+// Theme moved to ui/theme/Theme.kt + ui/theme/Color.kt (A12).
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Root app with bottom navigation
@@ -207,7 +192,7 @@ fun JoltApp(
     Scaffold(
         bottomBar = {
             NavigationBar(
-                containerColor = Color(0xFF111111),
+                containerColor = JoltColors.navBar,
                 tonalElevation = 0.dp,
                 modifier = Modifier.height(80.dp)
             ) {
@@ -289,13 +274,13 @@ fun PulsingAlertBorder(plate: String, onDismiss: () -> Unit) {
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .border(10.dp, Color(0xFFFFD700).copy(alpha = borderAlpha))
+                .border(10.dp, JoltColors.alertYellow.copy(alpha = borderAlpha))
         )
 
         // Warning card at top-center
         Card(
             shape    = RoundedCornerShape(8.dp),
-            colors   = CardDefaults.cardColors(containerColor = Color(0xFFFFD700)),
+            colors   = CardDefaults.cardColors(containerColor = JoltColors.alertYellow),
             modifier = Modifier
                 .align(Alignment.TopCenter)
                 .padding(top = 6.dp)
@@ -341,11 +326,11 @@ private fun RowScope.JoltNavItem(
         icon     = { Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp)) },
         label    = { Text(label, fontSize = 12.sp, fontWeight = FontWeight.SemiBold) },
         colors   = NavigationBarItemDefaults.colors(
-            selectedIconColor   = Color(0xFFFF1744),
-            selectedTextColor   = Color(0xFFFF1744),
+            selectedIconColor   = MaterialTheme.colorScheme.primary,
+            selectedTextColor   = MaterialTheme.colorScheme.primary,
             unselectedIconColor = Color.Gray,
             unselectedTextColor = Color.Gray,
-            indicatorColor      = Color(0xFF2A0A0F)
+            indicatorColor      = JoltColors.navIndicator
         )
     )
 }
@@ -372,7 +357,7 @@ fun MainScreen(
         // Notification banner (slides in at top)
         AnimatedVisibility(visible = bannerNotification != null) {
             Surface(
-                color = Color(0xFF00B0FF),
+                color = MaterialTheme.colorScheme.tertiary,
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
@@ -422,7 +407,7 @@ fun MainScreen(
             ) {
                 Text(
                     text       = "5× TELEPHOTO",
-                    color      = Color(0xFF00E676),
+                    color      = MaterialTheme.colorScheme.secondary,
                     fontSize   = 10.sp,
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold
@@ -450,7 +435,7 @@ fun MainScreen(
                             )
                             Text(
                                 text       = "LICENSE PLATE",
-                                color      = Color(0xFF00E676),
+                                color      = MaterialTheme.colorScheme.secondary,
                                 fontSize   = 9.sp,
                                 fontFamily = FontFamily.Monospace,
                                 textAlign  = TextAlign.Center
@@ -458,7 +443,7 @@ fun MainScreen(
                         } else {
                             Text(
                                 text       = activeMmc ?: "",
-                                color      = Color(0xFF00B0FF),
+                                color      = MaterialTheme.colorScheme.tertiary,
                                 fontSize   = 16.sp,
                                 fontWeight = FontWeight.Bold,
                                 textAlign  = TextAlign.Center
@@ -483,7 +468,7 @@ fun MainScreen(
                 .fillMaxWidth()
                 .weight(1f)
                 .padding(horizontal = 16.dp, vertical = 10.dp),
-            colors    = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF1744)),
+            colors    = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
             shape     = RoundedCornerShape(14.dp),
             elevation = ButtonDefaults.buttonElevation(defaultElevation = 8.dp)
         ) {
@@ -560,7 +545,7 @@ fun JoltMapScreen(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
                     .padding(12.dp)
-                    .background(Color(0xFFFF1744), RoundedCornerShape(4.dp))
+                    .background(MaterialTheme.colorScheme.primary, RoundedCornerShape(4.dp))
                     .padding(horizontal = 10.dp, vertical = 4.dp)
             ) {
                 Text(
@@ -582,7 +567,7 @@ fun JoltMapScreen(
                 }
             },
             modifier       = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-            containerColor = Color(0xFF1565C0),
+            containerColor = JoltColors.actionBlue,
             contentColor   = Color.White
         ) {
             Icon(Icons.Default.MyLocation, contentDescription = "Re-center map")
@@ -748,7 +733,7 @@ fun ExportScreen(logList: List<DriverLog>) {
         Button(
             onClick  = { exportToCsv(context, logList) },
             modifier = Modifier.fillMaxWidth().height(54.dp),
-            colors   = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0)),
+            colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
             shape    = RoundedCornerShape(10.dp)
         ) {
             Icon(Icons.Default.FileDownload, contentDescription = null)
@@ -767,7 +752,7 @@ fun ExportScreen(logList: List<DriverLog>) {
 
         // Training data export card (Phase 6 — shown as informational for now)
         Card(
-            colors   = CardDefaults.cardColors(containerColor = Color(0xFF1A1A1A)),
+            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape    = RoundedCornerShape(10.dp),
             modifier = Modifier.fillMaxWidth()
         ) {
@@ -835,7 +820,7 @@ fun ManageScreen(
             text             = { Text("This will permanently delete all ${logList.size} flagged captures.") },
             confirmButton    = {
                 TextButton(onClick = { onClearAll(); showClearDialog = false }) {
-                    Text("Delete All", color = Color(0xFFFF1744))
+                    Text("Delete All", color = MaterialTheme.colorScheme.primary)
                 }
             },
             dismissButton    = {
@@ -860,7 +845,7 @@ fun ManageScreen(
             if (logList.isNotEmpty()) {
                 Button(
                     onClick = { showClearDialog = true },
-                    colors  = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF1744)),
+                    colors  = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
                 ) {
                     Text("Clear All", color = Color.White, fontSize = 12.sp)
@@ -889,7 +874,7 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
     }
     Card(
         shape    = RoundedCornerShape(8.dp),
-        colors   = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+        colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         modifier = Modifier.fillMaxWidth()
     ) {
         Row(
@@ -913,7 +898,7 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
                 Text(text = fmt, color = Color.Gray, fontSize = 9.sp)
             }
             IconButton(onClick = onDelete) {
-                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color(0xFFFF1744))
+                Icon(Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.primary)
             }
         }
     }
@@ -925,7 +910,7 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
 
 @Composable
 fun DriverLogItemWidget(log: DriverLog) {
-    val ratingColor = if (log.rating == "BAD") Color(0xFFFF1744) else Color(0xFF00E676)
+    val ratingColor = if (log.rating == "BAD") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
     val formattedDate = remember(log.timestamp) {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(log.timestamp))
     }
@@ -936,7 +921,7 @@ fun DriverLogItemWidget(log: DriverLog) {
     }
     Card(
         shape    = RoundedCornerShape(8.dp),
-        colors   = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E)),
+        colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         modifier = Modifier.fillMaxWidth()
     ) {
         Row(
@@ -964,7 +949,7 @@ fun DriverLogItemWidget(log: DriverLog) {
                 } else {
                     Text(
                         text       = log.vehicleMmc ?: "Unidentified",
-                        color      = Color(0xFF00B0FF),
+                        color      = MaterialTheme.colorScheme.tertiary,
                         fontWeight = FontWeight.SemiBold,
                         fontSize   = 12.sp
                     )
@@ -997,7 +982,7 @@ fun DriverLogItemWidget(log: DriverLog) {
 
 @Composable
 fun BoundingBoxOverlay(boxes: List<RectF>, modifier: Modifier = Modifier) {
-    val green = Color(0xFF00E676)
+    val green = JoltColors.bboxGreen
     Canvas(modifier = modifier) {
         boxes.forEach { box ->
             val l = box.left   * size.width

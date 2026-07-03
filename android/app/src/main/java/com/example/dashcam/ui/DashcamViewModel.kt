@@ -193,6 +193,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                             lastSightingPlate = match.plateOcr
                             lastSightingTime = now
                             feedback.badDriverAlert()
+                            insertSighting(match, now)
                         }
                     }
                 } catch (e: Exception) {
@@ -202,6 +203,34 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         } else {
             // No plate in view — clear any active alert (sticky OCR timer handles its own clear)
             _knownBadDriverAlert.value = null
+        }
+    }
+
+    /**
+     * A21: log a lightweight "SIGHTING" row (no user action) when a known-bad plate is re-seen, so
+     * the Map shows where repeat encounters happen. Rating "SIGHTING" (not "BAD") keeps these rows
+     * out of findBadDriverByPlate lookups, so they never re-trigger alerts or spawn more sightings.
+     */
+    private suspend fun insertSighting(match: DriverLog, timestamp: Long) {
+        try {
+            val loc = _currentLocation.value
+            dao.safeInsertLog(
+                DriverLog(
+                    id = 0,
+                    rating = "SIGHTING",
+                    plateOcr = match.plateOcr,
+                    plateNormalized = match.plateNormalized,
+                    vehicleMmc = null,
+                    timestamp = timestamp,
+                    latitude = loc?.latitude ?: 0.0,
+                    longitude = loc?.longitude ?: 0.0,
+                    batteryLevel = batteryMonitor.getBatteryLevel(),
+                    plateCropPath = null
+                )
+            )
+            Log.i(TAG, "Auto-logged sighting of known-bad plate ${match.plateOcr}")
+        } catch (e: Exception) {
+            Log.e(TAG, "Sighting insert failed: ${e.localizedMessage}", e)
         }
     }
 

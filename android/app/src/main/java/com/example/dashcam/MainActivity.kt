@@ -995,7 +995,11 @@ fun EmptyState(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
 
 @Composable
 fun DriverLogItemWidget(log: DriverLog) {
-    val ratingColor = if (log.rating == "BAD") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+    val ratingColor = when (log.rating) {
+        "BAD"      -> MaterialTheme.colorScheme.primary
+        "SIGHTING" -> JoltColors.alertYellow
+        else       -> MaterialTheme.colorScheme.secondary
+    }
     val formattedDate = remember(log.timestamp) {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(log.timestamp))
     }

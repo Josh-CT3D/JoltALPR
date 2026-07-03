@@ -8,6 +8,7 @@ import android.provider.MediaStore
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -33,7 +34,7 @@ class TrainingDataCollector(private val context: Context) {
 
     /**
      * Called by TelephotoAnalyzer when a plate is detected in Training Mode.
-     * @param frameBitmap  Full ROI frame (bottom-65%-cropped) as a Bitmap.
+     * @param frameBitmap  Full camera frame (A6: no ROI crop) as a Bitmap.
      * @param plateBox     Bounding box of the detected plate within frameBitmap coordinates.
      */
     fun onPlateDetected(frameBitmap: Bitmap, plateBox: RectF) {
@@ -92,10 +93,14 @@ class TrainingDataCollector(private val context: Context) {
             put(MediaStore.Downloads.MIME_TYPE, "application/zip")
         }
 
+        val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+            ?: return null
+
         return try {
-            val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: return null
-            context.contentResolver.openOutputStream(uri)?.use { os ->
+            // R5: a null stream is a real failure — don't fall through and report false success.
+            val stream = context.contentResolver.openOutputStream(uri)
+                ?: throw IOException("Could not open output stream for $uri")
+            stream.use { os ->
                 ZipOutputStream(os.buffered()).use { zip ->
                     sampleDirs.forEach { dir ->
                         dir.listFiles()?.forEach { f ->
@@ -117,6 +122,8 @@ class TrainingDataCollector(private val context: Context) {
             zipName
         } catch (e: Exception) {
             Log.e(TAG, "Training ZIP export failed: ${e.localizedMessage}", e)
+            // R5: delete the MediaStore row we inserted so it doesn't linger as a 0-byte download.
+            try { context.contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             null
         }
     }

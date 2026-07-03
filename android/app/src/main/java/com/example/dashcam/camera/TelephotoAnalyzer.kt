@@ -10,10 +10,12 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Immutable plate box in fractional (0..1) frame coordinates, drawn by the UI overlay.
@@ -25,12 +27,18 @@ import kotlinx.coroutines.launch
 data class PlateBox(val left: Float, val top: Float, val right: Float, val bottom: Float)
 
 /**
- * CameraX ImageAnalysis.Analyzer running at 1 FPS.
+ * CameraX ImageAnalysis.Analyzer running at 2 FPS (see ANALYSIS_INTERVAL_MS).
  *
  * Pipeline (Phase 2):
  *  1. YOLOv8 license-plate detection on the full frame (A6: ROI crop removed — see below)
  *  2a. Plate found → ML Kit Text Recognition V2 → validate US plate regex → emit OCR string
  *  2b. No plate    → clear display (Option A: chip disappears)
+ *
+ * Threading (R1): the entire pipeline — YOLO detector init AND every detect() call — runs on a
+ * single dedicated thread (pipelineExecutor). The TFLite GPU delegate binds its EGL context to the
+ * thread that created the interpreter, so running detect() on any other thread throws
+ * "GpuDelegate must run on the same thread where it was initialized" and detection silently
+ * returns nothing. Confining the pipeline to one thread guarantees init and inference share it.
  *
  * Phase 5 will add the MMC fallback (EfficientNet-Lite0 make/model/color classifier).
  * Phase 6 adds the trainingCallback for annotated frame collection.
@@ -58,7 +66,17 @@ class TelephotoAnalyzer(
     val pipelineState: StateFlow<PipelineState> = _pipelineState
 
     private var lastAnalyzedTimestamp = 0L
-    private val frameDispatcher = Dispatchers.Default
+
+    // R1: single dedicated pipeline thread. The GPU delegate's EGL context is bound to the thread
+    // that created the interpreter, so the lazy yoloDetector init AND every detect() call must run
+    // on the same thread. Confining every frame coroutine here guarantees that.
+    private val pipelineExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "jolt-pipeline") }
+    private val frameDispatcher = pipelineExecutor.asCoroutineDispatcher()
+
+    // R2: the timestamp gate limits launch rate, not concurrency. With a serial pipeline (R1) a
+    // frame that takes longer than ANALYSIS_INTERVAL_MS would otherwise queue unboundedly. Drop
+    // any frame that arrives while the pipeline is still draining the previous one.
+    private val pipelineBusy = AtomicBoolean(false)
 
     // A15: multi-frame OCR voting. A single ML Kit misread (LT2379 -> LT2879) must not immediately
     // become the active plate and fire a false known-bad-driver alert. We keep a rolling window of
@@ -104,6 +122,13 @@ class TelephotoAnalyzer(
         }
         lastAnalyzedTimestamp = currentMillis
 
+        // R2: drop this frame if the previous one is still being processed (serial pipeline).
+        // Reset in the coroutine's finally below.
+        if (!pipelineBusy.compareAndSet(false, true)) {
+            image.close()
+            return
+        }
+
         // Read ImageProxy metadata synchronously before closing, then close immediately.
         // CameraX requires ImageProxy to be closed on the analyzer thread before returning.
         val rotationDegrees = image.imageInfo.rotationDegrees
@@ -119,6 +144,7 @@ class TelephotoAnalyzer(
             }
         } catch (e: Exception) {
             image.close()
+            pipelineBusy.set(false) // never launched the coroutine — release the gate here
             Log.e(TAG, "Frame decode failed: ${e.localizedMessage}", e)
             return
         }
@@ -142,16 +168,17 @@ class TelephotoAnalyzer(
                 _pipelineState.value = _pipelineState.value.copy(
                     lastStatusMessage = "Pipeline error: ${e.localizedMessage}"
                 )
+            } finally {
+                pipelineBusy.set(false)
             }
         }
     }
 
     /**
      * Phase 2 pipeline — single-class license plate detection.
-     * 1. Crop bottom 65% (discard sky / trees / buildings).
-     * 2. Run YOLOv8 → find best plate box.
-     * 3a. Plate found → compute fractional overlay boxes → crop → ML Kit OCR.
-     * 3b. No plate    → clear display (Option A).
+     * 1. Run YOLOv8 on the full frame (A6: no ROI crop — see the note in this method's body).
+     * 2a. Plate found → compute fractional overlay boxes → crop → ML Kit OCR.
+     * 2b. No plate    → clear display (Option A).
      */
     private suspend fun executeHybridMlPipeline(frameBitmap: Bitmap) {
         // A6 decision: use the FULL frame — do not crop to a bottom ROI.
@@ -196,13 +223,12 @@ class TelephotoAnalyzer(
                     val persistCrop = upscaleCrop(plateCrop)
                     plateCrop.recycle() // A4(c): raw crop is consumed once both upscales are made
 
-                    // Publish the persisted crop and recycle the one it replaces. Its other owner is
-                    // the ViewModel, which only reads it synchronously on FLAG press (>=1 frame apart).
-                    val previousCrop = _pipelineState.value.lastPlateCrop
+                    // R4: publish the persisted crop but do NOT recycle the previous one here. The
+                    // ViewModel owns published crops and recycles the prior bitmap when a new one
+                    // arrives in updateActiveDetection(). Recycling here raced flagBadDriver()'s
+                    // compress on the main thread and could null out the saved evidence photo;
+                    // ownership transfer keeps recycle and read/compress on the same (main) thread.
                     _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = persistCrop)
-                    if (previousCrop != null && previousCrop !== persistCrop && !previousCrop.isRecycled) {
-                        previousCrop.recycle()
-                    }
 
                     runMlKitOcr(ocrCrop) // takes ownership of ocrCrop
                 } else {
@@ -271,9 +297,10 @@ class TelephotoAnalyzer(
      * real plate and a common OCR artifact. Returns 1 for plausible, 0 otherwise.
      */
     private fun plateFormatScore(token: String): Int {
+        // Tokens are already pre-filtered upstream to length 5–8 with >=1 digit and >=1 letter
+        // (see runMlKitOcr), so the only real discriminator left is the digit-heavy artifact case.
         val letters = token.count { it.isLetter() }
         val digits  = token.count { it.isDigit() }
-        if (token.length !in 5..8 || letters == 0 || digits == 0) return 0
         if (letters == 1 && digits >= 6) return 0
         return 1
     }
@@ -443,6 +470,12 @@ class TelephotoAnalyzer(
             Log.i(TAG, "TelephotoAnalyzer cleaned up successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Error during cleanup: ${e.message}", e)
+        }
+        // R1: shut down the dedicated pipeline thread (also stops its executor).
+        try {
+            frameDispatcher.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing pipeline dispatcher: ${e.message}", e)
         }
     }
 

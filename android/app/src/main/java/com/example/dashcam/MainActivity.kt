@@ -77,8 +77,10 @@ import java.util.concurrent.Executors
 /**
  * Main Activity — Jolt ALPR Dashcam
  *
- * UI: landscape split-screen (camera left | OSMDroid map right) +
- * large red FLAG BAD DRIVER button + bottom navigation tabs.
+ * UI: portrait single-column layout with a 5-tab bottom navigation bar
+ * (Main / Map / History / Export / Manage). The Main tab hosts the live camera preview,
+ * the green bounding-box overlay, the OCR chip, and the large red FLAG BAD DRIVER button;
+ * the map lives on its own Map tab.
  *
  * Voice commands removed — physical button only.
  */
@@ -350,7 +352,7 @@ private fun RowScope.JoltNavItem(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main Screen: camera (left) | map (right) | FLAG button
+// Main Screen: camera preview + bounding-box overlay + OCR chip + FLAG button (portrait)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -602,14 +604,16 @@ fun JoltMapView(
     val lifecycleOwner = LocalLifecycleOwner.current
     val dateFormat     = remember { SimpleDateFormat("MM/dd  HH:mm", Locale.getDefault()) }
 
-    // Programmatic red circle — used as the flagged-capture pin icon
-    val redPinDrawable = remember {
+    // Programmatic circular pins (R10): red for user BAD flags, amber for auto-logged SIGHTING
+    // re-encounters, so repeat sightings read differently from flags. Colors match History's rating
+    // labels (JoltRed / JoltColors.alertYellow).
+    val makePin: (String) -> android.graphics.drawable.BitmapDrawable = { hexColor ->
         val dp  = context.resources.displayMetrics.density
         val sz  = (dp * 28).toInt()
         val bmp = android.graphics.Bitmap.createBitmap(sz, sz, android.graphics.Bitmap.Config.ARGB_8888)
         val cvs = android.graphics.Canvas(bmp)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
-        paint.color = android.graphics.Color.parseColor("#FF1744")
+        paint.color = android.graphics.Color.parseColor(hexColor)
         cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp, paint)
         paint.color = android.graphics.Color.WHITE
         paint.style = android.graphics.Paint.Style.STROKE
@@ -617,6 +621,8 @@ fun JoltMapView(
         cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp * 2.5f, paint)
         android.graphics.drawable.BitmapDrawable(context.resources, bmp)
     }
+    val redPinDrawable   = remember(context) { makePin("#FF1744") } // BAD flag
+    val amberPinDrawable = remember(context) { makePin("#FFD700") } // SIGHTING re-encounter
 
     // Holds the live MapView so the lifecycle observer below can actually pause/resume/detach it.
     // (Previously a local var that was never assigned, so onResume/onPause/onDetach were no-ops.)
@@ -658,15 +664,16 @@ fun JoltMapView(
         update = { mapView ->
             mapView.overlays.clear()
 
-            // Red circle pins for every flagged capture
+            // Circle pins for every log — red for BAD flags, amber for SIGHTING re-encounters (R10).
             // Tap a pin → OSMDroid shows the default info window with plate + time + battery
             logs.forEach { log ->
                 val marker = Marker(mapView).apply {
                     position = GeoPoint(log.latitude, log.longitude)
                     title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
-                    snippet  = dateFormat.format(Date(log.timestamp)) +
+                    snippet  = (if (log.rating == "SIGHTING") "SIGHTING  •  " else "") +
+                               dateFormat.format(Date(log.timestamp)) +
                                "  •  Battery ${com.ct3d.jolt.service.BatteryMonitor.format(log.batteryLevel)}"
-                    icon     = redPinDrawable
+                    icon     = if (log.rating == "SIGHTING") amberPinDrawable else redPinDrawable
                     setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                 }
                 mapView.overlays.add(marker)

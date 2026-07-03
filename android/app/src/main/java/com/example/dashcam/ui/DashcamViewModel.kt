@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -168,7 +169,15 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         _activePlateOcr.value = plateOcr
         _activeVehicleMmc.value = vehicleMmc
         _plateBoxes.value = plateBoxes
-        if (plateCrop != null) _lastPlateCrop.value = plateCrop
+        // R4: the ViewModel owns published plate crops. When the analyzer hands us a new one, recycle
+        // the bitmap it replaces here (main dispatcher) rather than in the analyzer — that kept
+        // recycle and flagBadDriver()'s compress on the same thread, so a FLAG press can't race a
+        // recycle. The `!==` guard skips no-op re-emissions that carry the same bitmap reference.
+        if (plateCrop != null) {
+            val prev = _lastPlateCrop.value
+            _lastPlateCrop.value = plateCrop
+            if (prev != null && prev !== plateCrop && !prev.isRecycled) prev.recycle()
+        }
 
         if (plateOcr != null) {
             // Update sticky OCR and reset the 5-second clear timer
@@ -313,7 +322,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
      */
     fun onTrainingSample(frame: Bitmap, box: RectF) {
         trainingCollector.onPlateDetected(frame, box)
-        _trainingSampleCount.value = _trainingSampleCount.value + 1
+        _trainingSampleCount.update { it + 1 } // R6: atomic — runs on the analyzer's pipeline thread
     }
 
     /** Zips collected training samples to Downloads/ (Roboflow/YOLO layout) for Google Drive sync. */

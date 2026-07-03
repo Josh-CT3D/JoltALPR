@@ -15,8 +15,6 @@ object Dimens {
     val spaceXl = 24.dp
 
     // Component-specific
-    val cardCorner  = 8.dp
-    val chipCorner  = 8.dp
     val alertBorder = 5.dp   // known-bad-driver pulsing border (reduced from 10dp in A13)
     val emptyIcon   = 48.dp  // empty-state icon size
 }

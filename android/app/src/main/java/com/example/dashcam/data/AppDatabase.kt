@@ -24,13 +24,23 @@ abstract class AppDatabase : RoomDatabase() {
 
         /**
          * v4 -> v5: add the plateNormalized column (A16) and create the A8/A16 indices. Existing
-         * rows get a NULL plateNormalized (they simply won't match confusion-folded lookups until
-         * re-flagged). Index names/columns match Room's generated schema (index_<table>_<cols>) so
-         * Room's post-migration validation passes. Data preserved.
+         * rows are backfilled (R3): plateNormalized is computed in-SQL to match normalizePlate()
+         * exactly — uppercase + the O/0, I/1, B/8, S/5 confusion fold — so drivers Jack flagged
+         * before the update keep triggering the known-bad alert (findBadDriverByPlate matches only
+         * on plateNormalized). Stored plateOcr tokens are already uppercase alphanumerics (the OCR
+         * tokenizer guarantees it), so no non-alphanumeric stripping is needed here. Index
+         * names/columns match Room's generated schema (index_<table>_<cols>) so Room's post-migration
+         * validation passes. Data preserved.
          */
         val MIGRATION_4_5 = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `plateNormalized` TEXT")
+                // R3: backfill the new column for pre-upgrade rows (mirrors normalizePlate()).
+                db.execSQL(
+                    "UPDATE `driver_logs` SET `plateNormalized` = " +
+                        "REPLACE(REPLACE(REPLACE(REPLACE(UPPER(`plateOcr`),'O','0'),'I','1'),'B','8'),'S','5') " +
+                        "WHERE `plateOcr` IS NOT NULL"
+                )
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_driver_logs_plateNormalized_rating` " +
                         "ON `driver_logs` (`plateNormalized`, `rating`)"

@@ -19,6 +19,7 @@ import com.ct3d.jolt.data.safeClearAllLogs
 import com.ct3d.jolt.data.safeInsertLocationRecord
 import com.ct3d.jolt.data.safeClearAllLocationRecords
 import com.ct3d.jolt.service.BatteryMonitor
+import com.ct3d.jolt.service.FeedbackController
 import com.ct3d.jolt.training.TrainingDataCollector
 import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
@@ -46,6 +47,12 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val dao = db.driverLogDao()
     private val batteryMonitor = BatteryMonitor(application)
     private val trainingCollector = TrainingDataCollector(application)
+    private val feedback = FeedbackController(application)
+
+    // Debounce known-bad encounters: the OCR pipeline reports the same plate many times/sec, but we
+    // only want one alert buzz + one auto-sighting per encounter (or per cooldown window). (A21)
+    private var lastSightingPlate: String? = null
+    private var lastSightingTime: Long = 0L
 
     // Room Flows — all flagged capture records
     val logsList: StateFlow<List<DriverLog>> = dao.getAllLogs()
@@ -178,6 +185,15 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     _knownBadDriverAlert.value = match
                     if (match != null) {
                         Log.w(TAG, "⚠️ KNOWN BAD DRIVER DETECTED: $plateOcr (previously flagged at ${match.timestamp})")
+                        // Fire haptic/sound (A21) and log a sighting (A21) once per encounter.
+                        val now = System.currentTimeMillis()
+                        val newEncounter = match.plateOcr != lastSightingPlate ||
+                            now - lastSightingTime > SIGHTING_COOLDOWN_MS
+                        if (newEncounter) {
+                            lastSightingPlate = match.plateOcr
+                            lastSightingTime = now
+                            feedback.badDriverAlert()
+                        }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Bad driver DB lookup failed: ${e.localizedMessage}", e)
@@ -201,6 +217,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
      * Plate crop image saving will be added in Phase 3.
      */
     fun flagBadDriver() {
+        feedback.flagPressed()
         viewModelScope.launch {
             try {
                 fetchUpdatedLocation()
@@ -339,11 +356,15 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         super.onCleared()
         locationCancellationSource.cancel()
+        feedback.release()
         try { fusedLocationClient.removeLocationUpdates(locationCallback) }
         catch (e: Exception) { Log.e(TAG, "Failed to remove location callback: ${e.localizedMessage}", e) }
     }
 
     companion object {
         private const val TAG = "DashcamViewModel"
+
+        // Same known-bad plate within this window counts as one encounter (one buzz + one sighting).
+        private const val SIGHTING_COOLDOWN_MS = 30_000L
     }
 }

@@ -1,0 +1,5 @@
+# Model label files are shipped as raw Android assets and read verbatim at runtime.
+# core.autocrlf=true on Windows would otherwise check them out with CRLF, and any parser
+# that splits on "\n" (rather than using readLines()) would end up with a trailing "\r"
+# on every class name — silently corrupting label lookups. Pin them to LF.
+android/app/src/main/assets/*.txt text eol=lf

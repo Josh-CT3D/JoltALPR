@@ -88,7 +88,14 @@ class MainActivity : ComponentActivity() {
 
     private val viewModel: DashcamViewModel by viewModels()
     private lateinit var cameraExecutor: ExecutorService
-    private var telephotoAnalyzer: TelephotoAnalyzer? = null
+
+    // R12: Compose state, NOT a plain var. On a fresh install permissions aren't granted yet, so
+    // setupServices() runs later from the async permission-result callback — after setContent has
+    // already composed. A plain var never notifies composition, so CameraPreviewWidget would read
+    // null forever and ImageAnalysis would never get an analyzer attached (preview still renders,
+    // so the failure is completely silent). Backing this with mutableStateOf makes the later
+    // assignment recompose the camera widget, which then attaches the analyzer.
+    private var telephotoAnalyzer by mutableStateOf<TelephotoAnalyzer?>(null)
 
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
@@ -1106,11 +1113,39 @@ fun CameraPreviewWidget(
     cameraProviderFuture: ListenableFuture<ProcessCameraProvider>,
     analyzer: TelephotoAnalyzer?
 ) {
+    val context = LocalContext.current
+
     // Backstop cleanup: the sensor listener is enabled/disabled on view attach/detach below, but
     // also disable it when this composable leaves composition so the sensor never stays live.
     val orientationListenerRef = remember { mutableStateOf<android.view.OrientationEventListener?>(null) }
     DisposableEffect(Unit) {
         onDispose { orientationListenerRef.value?.disable() }
+    }
+
+    // R12: the ImageAnalysis use case is built here rather than inside the AndroidView factory.
+    // The factory lambda runs exactly ONCE per view instance, so anything captured in it (like the
+    // analyzer reference) is frozen at first composition. On a fresh install the analyzer is still
+    // null at that moment — see MainActivity.telephotoAnalyzer — which used to mean setAnalyzer()
+    // was never called at all and the ML pipeline silently received zero frames for the whole
+    // session. Hoisting the use case lets the effect below (re)attach the analyzer whenever it
+    // changes. Bound once via bindToLifecycle in the factory; setAnalyzer is safe to call later.
+    val imageAnalysis = remember {
+        ImageAnalysis.Builder()
+            // RGBA_8888 output lets the analyzer build a Bitmap straight from the
+            // single plane buffer — no YUV→NV21→JPEG→RGB round-trip per frame.
+            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+    }
+
+    // R12: attach/detach reactively. Keyed on `analyzer`, so the null → non-null transition after
+    // the permission grant actually wires the pipeline up.
+    DisposableEffect(imageAnalysis, analyzer) {
+        if (analyzer != null) {
+            imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
+            Log.i("CameraPreviewWidget", "ImageAnalysis analyzer attached.")
+        }
+        onDispose { imageAnalysis.clearAnalyzer() }
     }
 
     AndroidView(
@@ -1124,17 +1159,6 @@ fun CameraPreviewWidget(
 
                     val preview = Preview.Builder().build().apply {
                         setSurfaceProvider(previewView.surfaceProvider)
-                    }
-
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        // RGBA_8888 output lets the analyzer build a Bitmap straight from the
-                        // single plane buffer — no YUV→NV21→JPEG→RGB round-trip per frame.
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .build()
-
-                    if (analyzer != null) {
-                        imageAnalysis.setAnalyzer(executor, analyzer)
                     }
 
                     // Auto-rotate CameraX with device orientation

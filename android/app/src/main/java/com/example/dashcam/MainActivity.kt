@@ -247,7 +247,8 @@ fun JoltApp(
                     trainingMode     = trainingMode,
                     trainingCount    = trainingCount,
                     onToggleTraining = viewModel::toggleTrainingMode,
-                    onExportTraining = viewModel::exportTrainingData
+                    onExportTraining = viewModel::exportTrainingData,
+                    onBackupDatabase = viewModel::backupDatabase
                 )
                 4 -> ManageScreen(
                     logList     = logList,
@@ -740,7 +741,8 @@ fun ExportScreen(
     trainingMode: Boolean,
     trainingCount: Int,
     onToggleTraining: () -> Unit,
-    onExportTraining: () -> Unit
+    onExportTraining: () -> Unit,
+    onBackupDatabase: () -> Unit
 ) {
     val context = LocalContext.current
 
@@ -776,6 +778,30 @@ fun ExportScreen(
             text     = "${logList.size} flagged capture${if (logList.size != 1) "s" else ""} in database",
             color    = Color.Gray,
             fontSize = 12.sp
+        )
+
+        Spacer(modifier = Modifier.height(Dimens.spaceMd))
+
+        // A21 #4: full backup (DB + evidence crops). CSV above is a readable report; this is the
+        // one that can actually bring the records back after a lost or wiped phone.
+        Button(
+            onClick  = onBackupDatabase,
+            enabled  = logList.isNotEmpty(),
+            modifier = Modifier.fillMaxWidth().height(54.dp),
+            colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
+            shape    = RoundedCornerShape(10.dp)
+        ) {
+            Icon(Icons.Default.Save, contentDescription = null)
+            Spacer(modifier = Modifier.width(10.dp))
+            Text("Backup Database (ZIP)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+        }
+        Spacer(modifier = Modifier.height(Dimens.spaceXs))
+        Text(
+            text     = "Includes plate crop images. Restore is a manual adb step — see " +
+                       "DatabaseBackup.restoreInstructions().",
+            color    = Color.Gray,
+            fontSize = 11.sp,
+            textAlign = TextAlign.Center
         )
 
         Spacer(modifier = Modifier.height(24.dp))

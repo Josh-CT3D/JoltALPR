@@ -9,6 +9,7 @@ import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.ct3d.jolt.data.AppDatabase
+import com.ct3d.jolt.data.DatabaseBackup
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.LocationRecord
 import com.ct3d.jolt.data.normalizePlate
@@ -48,6 +49,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val dao = db.driverLogDao()
     private val batteryMonitor = BatteryMonitor(application)
     private val trainingCollector = TrainingDataCollector(application)
+    private val databaseBackup = DatabaseBackup(application)
     private val feedback = FeedbackController(application)
 
     // Debounce known-bad encounters: the OCR pipeline reports the same plate many times/sec, but we
@@ -323,6 +325,22 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     fun onTrainingSample(frame: Bitmap, box: RectF) {
         trainingCollector.onPlateDetected(frame, box)
         _trainingSampleCount.update { it + 1 } // R6: atomic — runs on the analyzer's pipeline thread
+    }
+
+    /**
+     * A21 #4: back up the Room DB + evidence crops to Downloads/ as a ZIP.
+     * Guards against device loss/wipe — migrations only protect against schema bumps.
+     */
+    fun backupDatabase() {
+        viewModelScope.launch {
+            _notificationMessage.value = "Backing up records…"
+            val name = withContext(Dispatchers.IO) { databaseBackup.exportBackupToDownloads(db) }
+            _notificationMessage.value = if (name != null) {
+                "Backup saved: Downloads/$name"
+            } else {
+                "Backup failed — see logs."
+            }
+        }
     }
 
     /** Zips collected training samples to Downloads/ (Roboflow/YOLO layout) for Google Drive sync. */

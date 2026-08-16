@@ -244,7 +244,10 @@ class TelephotoAnalyzer(
                     // has already been recycled by our finally block — so snapshot a small 224²
                     // copy (~200 KB) NOW and hand it to the OCR call. Scoped to this invocation,
                     // so overlapping frames can't race over a shared field.
-                    val mmcFallback = if (mmcClassifier.isAvailable) scaleForMmc(roiBitmap) else null
+                    // O9: anchor the MMC crop to the plate box — it's the best vehicle-position
+                    // estimate we have, and it's free.
+                    val mmcFallback =
+                        if (mmcClassifier.isAvailable) buildMmcInput(roiBitmap, bestPlate.box) else null
                     runMlKitOcr(ocrCrop, mmcFallback) // takes ownership of both
                 } else {
                     Log.w(TAG, "Plate crop null — clearing display.")
@@ -257,7 +260,8 @@ class TelephotoAnalyzer(
                 resetVoteBuffer() // plate left frame — start voting fresh for the next one
                 clearDetectionState()
                 if (mmcClassifier.isAvailable) {
-                    classifyAndPublishMmc(scaleForMmc(roiBitmap))
+                    // O9: no plate box to anchor to — centre square crop (see buildMmcInput).
+                    classifyAndPublishMmc(buildMmcInput(roiBitmap))
                 }
             }
         } finally {
@@ -411,12 +415,69 @@ class TelephotoAnalyzer(
     // ── Phase 5: MMC fallback ──────────────────────────────────────────────────────────────────
 
     /**
-     * Small square snapshot for the MMC classifier, taken while the source frame is still alive.
-     * Holding a 224² copy (~200 KB) instead of the full frame is what lets the async OCR callback
-     * still run a fallback after [executeHybridMlPipeline]'s finally has recycled the frame.
+     * O9 / F2 — build the MMC input by cropping to roughly where the *vehicle* is, then scaling to
+     * the model's 224² input.
+     *
+     * Why crop at all: the classifier was fine-tuned on Stanford Cars, i.e. tightly-framed single
+     * vehicles. Feeding it a whole 480×640 scene put top-1 confidence at 0.07–0.14 — it essentially
+     * never fired. Pointing the camera at an actual training image scored 0.32–0.49 with the
+     * correct class, which isolated the cause as framing, not preprocessing.
+     *
+     * [plateBox] (frame pixel coords) is used when we have one: a US plate is ~1/6–1/8 of car
+     * width, so scaling outward from the plate reconstructs Stanford-Cars-like framing from
+     * geometry we already have — no extra model, no measurable latency. With no plate box we fall
+     * back to a centre square, which at 5× telephoto usually holds the followed vehicle.
+     *
+     * Also keeps the async path cheap: the result is a ~200 KB bitmap, so the OCR callback can
+     * still classify after [executeHybridMlPipeline]'s finally has recycled the full frame.
      */
-    private fun scaleForMmc(src: Bitmap): Bitmap =
-        Bitmap.createScaledBitmap(src, MMC_INPUT_SIZE, MMC_INPUT_SIZE, true)
+    private fun buildMmcInput(src: Bitmap, plateBox: RectF? = null): Bitmap {
+        val fw = src.width.toFloat()
+        val fh = src.height.toFloat()
+
+        val crop = if (plateBox != null && plateBox.width() > 1f && plateBox.height() > 1f) {
+            val pw = plateBox.width()
+            val ph = plateBox.height()
+            val cx = plateBox.centerX()
+            // Plate sits low-centre on a car: extend far more upward than downward.
+            RectF(
+                cx - MMC_CROP_WIDTH_MULT / 2f * pw,
+                plateBox.top - MMC_CROP_UP_MULT * ph,
+                cx + MMC_CROP_WIDTH_MULT / 2f * pw,
+                plateBox.bottom + MMC_CROP_DOWN_MULT * ph
+            )
+        } else {
+            val side = minOf(fw, fh)
+            val cx = fw / 2f
+            val cy = fh / 2f
+            RectF(cx - side / 2f, cy - side / 2f, cx + side / 2f, cy + side / 2f)
+        }
+
+        // Clamp to the frame, then guard against a degenerate rect (plate at the very edge).
+        val l = crop.left.coerceIn(0f, fw - 1f).toInt()
+        val t = crop.top.coerceIn(0f, fh - 1f).toInt()
+        val r = crop.right.coerceIn(l + 1f, fw).toInt()
+        val b = crop.bottom.coerceIn(t + 1f, fh).toInt()
+        val w = r - l
+        val h = b - t
+
+        val cropped = if (w > 1 && h > 1 && (w < src.width || h < src.height)) {
+            try {
+                Bitmap.createBitmap(src, l, t, w, h)
+            } catch (e: Exception) {
+                Log.w(TAG, "MMC crop failed (${e.message}) — using full frame")
+                null
+            }
+        } else null
+
+        val source = cropped ?: src
+        // Squash to a square, matching train_mmc.py's Resize((224,224)) — aspect ratio is
+        // intentionally not preserved, because that's how the model was trained.
+        val scaled = Bitmap.createScaledBitmap(source, MMC_INPUT_SIZE, MMC_INPUT_SIZE, true)
+        // createBitmap may hand back the source instance; only recycle a genuinely new intermediate.
+        if (cropped != null && cropped !== scaled && cropped !== src) cropped.recycle()
+        return scaled
+    }
 
     /**
      * Hop from the ML Kit callback (main thread) back onto the pipeline thread before touching the
@@ -437,6 +498,17 @@ class TelephotoAnalyzer(
      */
     private fun classifyAndPublishMmc(vehicleBitmap: Bitmap) {
         try {
+            // C1 stale-fallback guard. Path (b) is inherently reorderable: this task was queued from
+            // an ML Kit callback for frame N, and frame N+1 may already have published a plate
+            // consensus by the time it runs. Publishing anyway would null a live activePlateocr —
+            // which DashcamViewModel.updateActiveDetection reads as "no plate in view" and uses to
+            // CLEAR _knownBadDriverAlert, blinking out an active known-bad border. A plate we can
+            // actually read always beats a guess, so if one is on screen, this fallback lost the
+            // race and is dropped. Safe to check here: both writers run on the pipeline thread.
+            if (_pipelineState.value.activePlateocr != null) {
+                Log.d(TAG, "MMC fallback dropped — a plate consensus is already displayed")
+                return
+            }
             val prediction = mmcClassifier.classify(vehicleBitmap) ?: return
             Log.i(TAG, "MMC fallback: ${prediction.label} (conf=${"%.3f".format(prediction.confidence)})")
             _pipelineState.value = _pipelineState.value.copy(
@@ -570,5 +642,13 @@ class TelephotoAnalyzer(
         // Phase 5: MMC model input edge. Snapshots are pre-scaled to this so the async OCR-failure
         // path holds ~200 KB instead of a full frame (MmcClassifier rescales defensively anyway).
         private const val MMC_INPUT_SIZE = 224
+
+        // O9 / F2: plate-box-anchored crop geometry. A US plate is ~1/6–1/8 of car width and sits
+        // low-centre, so growing outward from the box approximates a Stanford-Cars framing.
+        // 6×plate-width by 7×plate-height lands near 1.7:1 (plates are ~2:1), i.e. a landscape
+        // car-photo shape. Tune from the "MMC top3" logs after a real drive.
+        private const val MMC_CROP_WIDTH_MULT = 6.0f
+        private const val MMC_CROP_UP_MULT    = 4.5f
+        private const val MMC_CROP_DOWN_MULT  = 1.5f
     }
 }

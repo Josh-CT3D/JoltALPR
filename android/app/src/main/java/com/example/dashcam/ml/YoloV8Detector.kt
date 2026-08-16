@@ -297,13 +297,14 @@ class YoloV8Detector(private val context: Context) {
     /**
      * Load TFLite model file from assets folder.
      */
+    // C5: the descriptor and stream were both left open here. The mapping survives closing them,
+    // so use() both. Kept identical to MmcClassifier.loadModelFile so the two don't drift.
     private fun loadModelFile(filename: String): MappedByteBuffer {
-        val fileDescriptor = context.assets.openFd(filename)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
+        context.assets.openFd(filename).use { fd ->
+            FileInputStream(fd.fileDescriptor).use { input ->
+                return input.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+            }
+        }
     }
 
     /**

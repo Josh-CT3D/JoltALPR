@@ -42,22 +42,7 @@ class DatabaseBackup(private val context: Context) {
             return null
         }
 
-        // Room runs in WAL mode: recent commits can still live in the -wal sidecar, so copying the
-        // main file alone can silently drop the newest flags. TRUNCATE merges the WAL back into the
-        // db and empties it, leaving one self-contained file to archive.
-        try {
-            db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").use { c ->
-                if (c.moveToFirst()) {
-                    // columns: busy, log pages, checkpointed pages. busy != 0 means readers blocked it.
-                    if (c.getInt(0) != 0) {
-                        Log.w(TAG, "WAL checkpoint reported busy — backup may omit the newest rows.")
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            // Non-fatal: we still archive what's on disk rather than failing the whole backup.
-            Log.w(TAG, "WAL checkpoint failed (${e.localizedMessage}) — continuing with file as-is.")
-        }
+        val snapshot = createSnapshot(db, dbFile)
 
         val cropsDir = File(context.filesDir, "crops")
         val cropFiles = cropsDir.listFiles()?.filter { it.isFile } ?: emptyList()
@@ -80,8 +65,10 @@ class DatabaseBackup(private val context: Context) {
                 ?: throw IOException("Could not open output stream for $uri")
             stream.use { os ->
                 ZipOutputStream(os.buffered()).use { zip ->
+                    // Entry name stays DB_NAME regardless of where the snapshot came from, so the
+                    // archive layout is identical on both the VACUUM and fallback paths.
                     zip.putNextEntry(ZipEntry(DB_NAME))
-                    dbFile.inputStream().use { it.copyTo(zip) }
+                    snapshot.inputStream().use { it.copyTo(zip) }
                     zip.closeEntry()
 
                     cropFiles.forEach { crop ->
@@ -92,18 +79,68 @@ class DatabaseBackup(private val context: Context) {
                 }
             }
             Log.i(TAG, "Backup written: Downloads/$zipName " +
-                       "(db ${dbFile.length() / 1024}KB + ${cropFiles.size} crops)")
+                       "(db ${snapshot.length() / 1024}KB + ${cropFiles.size} crops)")
             zipName
         } catch (e: Exception) {
             Log.e(TAG, "Backup failed: ${e.localizedMessage}", e)
             // R5 pattern: drop the placeholder row so a 0-byte "backup" can't masquerade as real.
             try { context.contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             null
+        } finally {
+            if (snapshot != dbFile) snapshot.delete()
         }
     }
 
-    /** Count of records that would be included, for the UI label. */
-    fun cropCount(): Int = File(context.filesDir, "crops").listFiles()?.count { it.isFile } ?: 0
+    /**
+     * C4: produce a consistent copy of the database to archive.
+     *
+     * Prefers SQLite's `VACUUM INTO`, which runs inside a read transaction — so the output is a
+     * true point-in-time snapshot even though location breadcrumbs keep inserting every 5s, and it
+     * compacts the file as a bonus. (Available since SQLite 3.32; minSdk 31 ships well past that.)
+     *
+     * Falls back to checkpoint-then-copy-in-place. That's nearly always fine — after
+     * `wal_checkpoint(TRUNCATE)` new writes go to a fresh WAL and the main file only changes at the
+     * next checkpoint — but it isn't consistent *by construction*, which is why VACUUM is preferred.
+     *
+     * @return the file to archive: a temp snapshot in cacheDir, or [dbFile] itself on the fallback
+     *         path. Callers must delete the result if it differs from [dbFile].
+     */
+    private fun createSnapshot(db: AppDatabase, dbFile: File): File {
+        val tmp = File(context.cacheDir, "jolt_backup_snapshot.db")
+        tmp.delete() // VACUUM INTO refuses to write to an existing file
+        return try {
+            // Path is app-internal (no quotes possible), but escape anyway rather than rely on it.
+            val escaped = tmp.absolutePath.replace("'", "''")
+            db.openHelper.writableDatabase.execSQL("VACUUM INTO '$escaped'")
+            if (!tmp.exists() || tmp.length() == 0L) throw IOException("VACUUM INTO produced no file")
+            Log.i(TAG, "Snapshot via VACUUM INTO (${tmp.length() / 1024}KB)")
+            tmp
+        } catch (e: Exception) {
+            Log.w(TAG, "VACUUM INTO unavailable (${e.localizedMessage}) — checkpoint+copy fallback")
+            tmp.delete()
+            checkpointWal(db)
+            dbFile
+        }
+    }
+
+    /**
+     * Fold the -wal sidecar back into the main database. Only needed on the fallback path: without
+     * it, recent commits live in the sidecar and copying the .db alone silently drops the newest
+     * flags. TRUNCATE also empties the WAL, leaving one self-contained file.
+     */
+    private fun checkpointWal(db: AppDatabase) {
+        try {
+            db.openHelper.writableDatabase.query("PRAGMA wal_checkpoint(TRUNCATE)").use { c ->
+                // columns: busy, log pages, checkpointed pages. busy != 0 means readers blocked it.
+                if (c.moveToFirst() && c.getInt(0) != 0) {
+                    Log.w(TAG, "WAL checkpoint reported busy — backup may omit the newest rows.")
+                }
+            }
+        } catch (e: Exception) {
+            // Non-fatal: archive what's on disk rather than failing the whole backup.
+            Log.w(TAG, "WAL checkpoint failed (${e.localizedMessage}) — continuing with file as-is.")
+        }
+    }
 
     companion object {
         private const val TAG = "DatabaseBackup"
@@ -112,23 +149,37 @@ class DatabaseBackup(private val context: Context) {
         /**
          * Manual restore procedure (deliberately not automated — see class kdoc).
          *
+         * C3: staged through `/data/local/tmp`, NOT `/sdcard`. Files adb-pushed to shared storage
+         * are owned by shell/media_rw, and this app holds no storage permission — so the `run-as`
+         * process (running as the app uid) frequently cannot read them back. `/data/local/tmp` is
+         * world-traversable and the pushed files land 0644, which the app uid can read.
+         *
          * With the app FORCE-STOPPED, from a machine with adb:
          * ```
          *   unzip jolt_backup_<ts>.zip -d restore/
-         *   adb push restore/driver_behavior_dashcam_db /sdcard/
-         *   adb shell run-as com.ct3d.jolt cp /sdcard/driver_behavior_dashcam_db \
+         *
+         *   adb push restore/driver_behavior_dashcam_db /data/local/tmp/
+         *   adb shell run-as com.ct3d.jolt cp /data/local/tmp/driver_behavior_dashcam_db \
          *       /data/data/com.ct3d.jolt/databases/driver_behavior_dashcam_db
-         *   # remove stale sidecars so SQLite doesn't replay an old WAL over the restored file
+         *
+         *   # Delete stale sidecars, or SQLite replays an old WAL over the restored file.
          *   adb shell run-as com.ct3d.jolt rm -f \
          *       /data/data/com.ct3d.jolt/databases/driver_behavior_dashcam_db-wal \
          *       /data/data/com.ct3d.jolt/databases/driver_behavior_dashcam_db-shm
-         *   # crops must go back too or every History thumbnail restores blank
-         *   adb push restore/crops/. /sdcard/crops/
-         *   adb shell run-as com.ct3d.jolt cp -r /sdcard/crops/. \
+         *
+         *   # Crops must go back too, or every History thumbnail restores blank.
+         *   adb push restore/crops /data/local/tmp/
+         *   adb shell run-as com.ct3d.jolt mkdir -p /data/data/com.ct3d.jolt/files/crops
+         *   adb shell run-as com.ct3d.jolt cp -r /data/local/tmp/crops/. \
          *       /data/data/com.ct3d.jolt/files/crops/
+         *
+         *   adb shell rm -rf /data/local/tmp/crops /data/local/tmp/driver_behavior_dashcam_db
          * ```
-         * plateCropPath stores absolute paths, so this only round-trips onto the same package on
-         * the same user profile. Moving to a different device/profile needs a path rewrite.
+         * `plateCropPath` stores ABSOLUTE paths, so this only round-trips onto the same package on
+         * the same user profile. A different device/profile needs a path rewrite pass first.
+         *
+         * REHEARSE THIS ONCE on a throwaway backup before you ever need it for real — an untested
+         * restore is a hope, not a backup.
          */
         fun restoreInstructions(): String = "See DatabaseBackup.restoreInstructions() kdoc"
     }

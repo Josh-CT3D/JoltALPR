@@ -218,10 +218,13 @@ class MmcClassifier(private val context: Context) {
     /** "Chevrolet_Express_Van_2007" -> "Chevrolet Express Van 2007" for on-screen display. */
     private fun displayLabel(raw: String): String = raw.replace('_', ' ')
 
+    // C5: close the AssetFileDescriptor too, not just the stream — the mapping stays valid after
+    // both are closed, so there's nothing to keep open.
     private fun loadModelFile(filename: String): MappedByteBuffer {
-        val fd = context.assets.openFd(filename)
-        FileInputStream(fd.fileDescriptor).use { input ->
-            return input.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+        context.assets.openFd(filename).use { fd ->
+            FileInputStream(fd.fileDescriptor).use { input ->
+                return input.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+            }
         }
     }
 
@@ -242,11 +245,18 @@ class MmcClassifier(private val context: Context) {
         private const val LABELS_ASSET = "mmc_class_names.txt"
 
         /**
-         * Top-1 softmax floor for showing an MMC guess. 196 fine-grained classes means the model
-         * legitimately spreads probability across similar trims, so this is deliberately low —
-         * a wrong "Toyota Camry 2011" is cheap, a missing fallback is the thing we're avoiding.
-         * Tune from the "MMC top3" logs after a real drive.
+         * Top-1 softmax floor for showing an MMC guess.
+         *
+         * Lowered 0.35 → 0.25 (O9/F2). Two reasons the original was mis-calibrated:
+         *  1. 196 fine-grained classes spread probability across near-identical trims.
+         *  2. train_mmc.py trains with `CrossEntropyLoss(label_smoothing=0.1)`, which by
+         *     construction stops the model ever becoming very peaky — measured ceiling on a
+         *     *known training image filling the frame* was only 0.32–0.49. A 0.35 floor was
+         *     therefore demanding near-best-case confidence just to show anything.
+         *
+         * A wrong "Toyota Camry 2011" is cheap; a fallback that never fires is the failure mode
+         * we're actually avoiding. Re-tune from the "MMC top3" logs after a real drive.
          */
-        const val MIN_MMC_CONFIDENCE = 0.35f
+        const val MIN_MMC_CONFIDENCE = 0.25f
     }
 }

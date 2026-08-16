@@ -5,6 +5,7 @@ import android.graphics.*
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import com.ct3d.jolt.ml.MmcClassifier
 import com.ct3d.jolt.ml.YoloV8Detector
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
@@ -104,6 +105,14 @@ class TelephotoAnalyzer(
                 Log.e(TAG, "Failed to initialize YOLOv8 detector: ${e.message}", e)
             }
         }
+    }
+
+    // Phase 5 MMC fallback. Lazy like yoloDetector, and for the same R1 reason: first touch happens
+    // inside a pipeline coroutine, so the interpreter is created on the jolt-pipeline thread that
+    // every classify() call also runs on. initialize() never throws — if the (gitignored) model
+    // asset is absent, isAvailable stays false and the pipeline behaves exactly as it did pre-P5.
+    private val mmcClassifier by lazy {
+        MmcClassifier(context).apply { initialize() }
     }
 
     data class Detection(
@@ -230,15 +239,26 @@ class TelephotoAnalyzer(
                     // ownership transfer keeps recycle and read/compress on the same (main) thread.
                     _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = persistCrop)
 
-                    runMlKitOcr(ocrCrop) // takes ownership of ocrCrop
+                    // Phase 5 trigger (b): OCR may still fail to yield a usable token. ML Kit is
+                    // async and its callbacks land on the MAIN thread, by which point frameBitmap
+                    // has already been recycled by our finally block — so snapshot a small 224²
+                    // copy (~200 KB) NOW and hand it to the OCR call. Scoped to this invocation,
+                    // so overlapping frames can't race over a shared field.
+                    val mmcFallback = if (mmcClassifier.isAvailable) scaleForMmc(roiBitmap) else null
+                    runMlKitOcr(ocrCrop, mmcFallback) // takes ownership of both
                 } else {
                     Log.w(TAG, "Plate crop null — clearing display.")
                     clearDetectionState()
                 }
             } else {
-                Log.d(TAG, "No plate detected — clearing display (Option A).")
+                // Phase 5 trigger (a): no plate box at all — identify the vehicle instead of
+                // showing nothing. We're already on the pipeline thread, so classify inline.
+                Log.d(TAG, "No plate detected — trying MMC fallback (Option A).")
                 resetVoteBuffer() // plate left frame — start voting fresh for the next one
                 clearDetectionState()
+                if (mmcClassifier.isAvailable) {
+                    classifyAndPublishMmc(scaleForMmc(roiBitmap))
+                }
             }
         } finally {
             // A4(b): the full frame is fully consumed here — YOLO copies it into its own scratch
@@ -325,8 +345,12 @@ class TelephotoAnalyzer(
      * Runs ML Kit OCR on an already-upscaled plate crop. Takes ownership of [plateBitmap]: ML Kit
      * reads it asynchronously, so it must not be recycled until the task completes — the
      * completion listener recycles it (covers both success and failure).
+     *
+     * Also takes ownership of [mmcFallback] (Phase 5): a 224² snapshot of the frame, captured
+     * before the frame was recycled, used only if OCR fails to produce a usable plate token.
+     * Every branch below either recycles it or hands it to [dispatchMmcFallback], which does.
      */
-    private fun runMlKitOcr(plateBitmap: Bitmap) {
+    private fun runMlKitOcr(plateBitmap: Bitmap, mmcFallback: Bitmap? = null) {
         val inputImage = InputImage.fromBitmap(plateBitmap, 0)
         ocrRecognizer.process(inputImage)
             .addOnCompleteListener {
@@ -346,6 +370,9 @@ class TelephotoAnalyzer(
                         token.any { it.isLetter() }
                     }
                     if (plateToken != null) {
+                        // The plate is readable, so the MMC fallback isn't needed either way —
+                        // whether or not the vote has converged yet.
+                        recycleQuietly(mmcFallback)
                         // A15: only publish once the token wins a vote across recent frames.
                         val consensus = registerAndVote(plateToken)
                         if (consensus != null) {
@@ -364,31 +391,68 @@ class TelephotoAnalyzer(
                             )
                         }
                     } else {
-                        Log.w(TAG, "OCR '$clean' — no plate-like token found, clearing display.")
+                        Log.w(TAG, "OCR '$clean' — no plate-like token found; trying MMC fallback.")
                         clearDetectionState()
+                        dispatchMmcFallback(mmcFallback)
                     }
                 } else {
-                    Log.w(TAG, "ML Kit returned empty — clearing display.")
+                    Log.w(TAG, "ML Kit returned empty; trying MMC fallback.")
                     clearDetectionState()
+                    dispatchMmcFallback(mmcFallback)
                 }
             }
             .addOnFailureListener { e ->
                 Log.e(TAG, "ML Kit OCR failed: ${e.localizedMessage}", e)
                 clearDetectionState()
+                dispatchMmcFallback(mmcFallback)
             }
     }
 
+    // ── Phase 5: MMC fallback ──────────────────────────────────────────────────────────────────
+
     /**
-     * Phase 5 stub — EfficientNet-Lite0 make/model/color classifier.
-     * Not called in Phase 2 (Option A: show nothing when no plate detected).
+     * Small square snapshot for the MMC classifier, taken while the source frame is still alive.
+     * Holding a 224² copy (~200 KB) instead of the full frame is what lets the async OCR callback
+     * still run a fallback after [executeHybridMlPipeline]'s finally has recycled the frame.
      */
-    @Suppress("unused")
-    private fun runMmcClassification(vehicleBitmap: Bitmap): String {
-        val makes  = listOf("Tesla Model Y", "Toyota RAV4", "Honda Accord", "Ford F-150", "Chevy Silverado")
-        val colors = listOf("White", "Charcoal", "Silver", "Red", "Blue")
-        val m = makes[(vehicleBitmap.width + vehicleBitmap.height) % makes.size]
-        val c = colors[(vehicleBitmap.width * vehicleBitmap.height) % colors.size]
-        return "$c $m"
+    private fun scaleForMmc(src: Bitmap): Bitmap =
+        Bitmap.createScaledBitmap(src, MMC_INPUT_SIZE, MMC_INPUT_SIZE, true)
+
+    /**
+     * Hop from the ML Kit callback (main thread) back onto the pipeline thread before touching the
+     * classifier. R1: the TFLite GPU delegate's EGL context is bound to `jolt-pipeline`, so running
+     * inference on the main thread would throw and be swallowed — and it would jank the UI besides.
+     */
+    private fun dispatchMmcFallback(mmcFallback: Bitmap?) {
+        val bmp = mmcFallback ?: return
+        uiScope.launch(frameDispatcher) { classifyAndPublishMmc(bmp) }
+    }
+
+    /**
+     * Classify [vehicleBitmap] and publish the result as the MMC fallback. Takes ownership of the
+     * bitmap and always recycles it. MUST run on the pipeline thread (see [dispatchMmcFallback]).
+     *
+     * Leaves state untouched when the classifier declines (below confidence floor / unavailable) —
+     * callers have already cleared the display, so "no guess" simply shows nothing.
+     */
+    private fun classifyAndPublishMmc(vehicleBitmap: Bitmap) {
+        try {
+            val prediction = mmcClassifier.classify(vehicleBitmap) ?: return
+            Log.i(TAG, "MMC fallback: ${prediction.label} (conf=${"%.3f".format(prediction.confidence)})")
+            _pipelineState.value = _pipelineState.value.copy(
+                activePlateocr    = null,   // mutually exclusive with MMC (DriverLog stores one or the other)
+                activeVehicleMmc  = prediction.label,
+                lastStatusMessage = "MMC: ${prediction.label}"
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "MMC fallback failed: ${e.localizedMessage}", e)
+        } finally {
+            recycleQuietly(vehicleBitmap)
+        }
+    }
+
+    private fun recycleQuietly(bmp: Bitmap?) {
+        if (bmp != null && !bmp.isRecycled) bmp.recycle()
     }
 
     /**
@@ -467,6 +531,7 @@ class TelephotoAnalyzer(
     fun cleanup() {
         try {
             yoloDetector.close()
+            mmcClassifier.close()
             Log.i(TAG, "TelephotoAnalyzer cleaned up successfully")
         } catch (e: Exception) {
             Log.e(TAG, "Error during cleanup: ${e.message}", e)
@@ -501,5 +566,9 @@ class TelephotoAnalyzer(
 
         // A19: only collect training frames from confident detections (cleaner labels).
         private const val TRAINING_MIN_CONFIDENCE = 0.7f
+
+        // Phase 5: MMC model input edge. Snapshots are pre-scaled to this so the async OCR-failure
+        // path holds ~200 KB instead of a full frame (MmcClassifier rescales defensively anyway).
+        private const val MMC_INPUT_SIZE = 224
     }
 }

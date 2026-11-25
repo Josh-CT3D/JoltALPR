@@ -12,6 +12,12 @@ import android.util.Log
  */
 class BatteryMonitor(private val context: Context) {
 
+    data class Snapshot(
+        val levelPct: Int,
+        val temperatureC: Float?,
+        val isCharging: Boolean
+    )
+
     // Last successfully-resolved level (0..100). Used as a fallback when a single read momentarily
     // fails, so a transient glitch doesn't get persisted as the sentinel value.
     @Volatile
@@ -22,19 +28,10 @@ class BatteryMonitor(private val context: Context) {
      * back to the last-known-good reading; only returns [BATTERY_UNKNOWN] if no read has ever
      * succeeded. Callers should render [BATTERY_UNKNOWN] via [format], not as a raw "-1%".
      */
-    fun getBatteryLevel(): Int {
-        val read = readBatteryLevel()
-        return if (read in 0..100) {
-            lastKnownGood = read
-            read
-        } else {
-            Log.w("BatteryMonitor", "Battery read failed; falling back to last-known-good=$lastKnownGood")
-            lastKnownGood
-        }
-    }
+    fun getBatteryLevel(): Int = getSnapshot().levelPct
 
-    /** Raw system read. Returns [BATTERY_UNKNOWN] on any failure. */
-    private fun readBatteryLevel(): Int {
+    /** Reads battery %, temperature in °C, and charging state in a single broadcast query. */
+    fun getSnapshot(): Snapshot {
         return try {
             val batteryStatus: Intent? = context.registerReceiver(
                 null,
@@ -42,18 +39,25 @@ class BatteryMonitor(private val context: Context) {
             )
             val level = batteryStatus?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
             val scale = batteryStatus?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
+            val tempTenths = batteryStatus?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, Int.MIN_VALUE)
+                ?: Int.MIN_VALUE
+            val status = batteryStatus?.getIntExtra(BatteryManager.EXTRA_STATUS, -1) ?: -1
 
-            if (level >= 0 && scale > 0) {
-                val percentage = (level * 100 / scale.toFloat()).toInt().coerceIn(0, 100)
-                Log.i("BatteryMonitor", "Resolved system battery level percentage: $percentage%")
-                percentage
+            val pct = if (level >= 0 && scale > 0) {
+                val resolved = (level * 100 / scale.toFloat()).toInt().coerceIn(0, 100)
+                lastKnownGood = resolved
+                resolved
             } else {
-                Log.w("BatteryMonitor", "Invalid battery level metrics received: level=$level, scale=$scale")
-                BATTERY_UNKNOWN
+                lastKnownGood
             }
+            val tempC = if (tempTenths in -400..1200) tempTenths / 10f else null
+            val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+
+            Snapshot(levelPct = pct, temperatureC = tempC, isCharging = charging)
         } catch (e: Exception) {
-            Log.e("BatteryMonitor", "CRITICAL ERROR: Failed to register receiver or parse battery stats: ${e.localizedMessage}", e)
-            BATTERY_UNKNOWN
+            Log.e("BatteryMonitor", "Failed to read battery snapshot: ${e.localizedMessage}", e)
+            Snapshot(levelPct = lastKnownGood, temperatureC = null, isCharging = false)
         }
     }
 

@@ -14,6 +14,7 @@ import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.LocationRecord
 import com.ct3d.jolt.data.normalizePlate
 import com.ct3d.jolt.camera.PlateBox
+import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.safeInsertLog
 import com.ct3d.jolt.data.safeDeleteLog
 import com.ct3d.jolt.data.safeClearAllLogs
@@ -21,13 +22,16 @@ import com.ct3d.jolt.data.safeInsertLocationRecord
 import com.ct3d.jolt.data.safeClearAllLocationRecords
 import com.ct3d.jolt.service.BatteryMonitor
 import com.ct3d.jolt.service.FeedbackController
+import com.ct3d.jolt.service.FieldTelemetryLogger
 import com.ct3d.jolt.training.TrainingDataCollector
 import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -35,6 +39,7 @@ import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
+import kotlin.coroutines.resume
 
 /**
  * MVVM ViewModel — manages all app state, Room DB writes, GPS tracking,
@@ -51,6 +56,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val trainingCollector = TrainingDataCollector(application)
     private val databaseBackup = DatabaseBackup(application)
     private val feedback = FeedbackController(application)
+    private val telemetryLogger = FieldTelemetryLogger(application, batteryMonitor)
 
     // Debounce known-bad encounters: the OCR pipeline reports the same plate many times/sec, but we
     // only want one alert buzz + one auto-sighting per encounter (or per cooldown window). (A21)
@@ -82,14 +88,24 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val _plateBoxes = MutableStateFlow<List<PlateBox>>(emptyList())
     val plateBoxes: StateFlow<List<PlateBox>> = _plateBoxes
 
+    // Analyzed frame aspect ratio (width / height) for accurate FILL_CENTER overlay alignment.
+    private val _frameAspectRatio = MutableStateFlow(0.75f)
+    val frameAspectRatio: StateFlow<Float> = _frameAspectRatio
+
     // Sticky OCR: holds the last confident plate read for 5s after it leaves frame,
     // so the FLAG button always captures the most recently seen plate.
     private val _lastConfidentOcr = MutableStateFlow<String?>(null)
     val lastConfidentOcr: StateFlow<String?> = _lastConfidentOcr
     private var ocrStickyJob: Job? = null
 
-    // Most recent plate crop bitmap — used to save a JPEG when FLAG is pressed.
+    // Most recent plate crop bitmap — held up to 5s after a plate leaves view, then cleared
+    // and recycled so a stale plate photo never attaches to a subsequent MMC-only vehicle flag.
     private val _lastPlateCrop = MutableStateFlow<Bitmap?>(null)
+    private var cropStickyJob: Job? = null
+
+    // Plate dismissed by user tap (✕) — stays suppressed while continuously in view, resets once
+    // the plate stays out of view past the sticky window.
+    private var dismissedAlertPlateNormalized: String? = null
 
     // Transient notification banners shown on the main screen
     private val _notificationMessage = MutableStateFlow<String?>(null)
@@ -102,6 +118,14 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     // Count of collected training samples on disk (drives the Export tab label).
     private val _trainingSampleCount = MutableStateFlow(0)
     val trainingSampleCount: StateFlow<Int> = _trainingSampleCount
+
+    // Field Telemetry & Soak Logger (persisted across restarts so mounted drives stay recorded)
+    private val _telemetryEnabled = MutableStateFlow(telemetryLogger.isPersistedEnabled())
+    val telemetryEnabled: StateFlow<Boolean> = _telemetryEnabled
+
+    private val _telemetryEventCount = MutableStateFlow(telemetryLogger.currentEventCount())
+    val telemetryEventCount: StateFlow<Int> = _telemetryEventCount
+    private var healthTelemetryJob: Job? = null
 
     /**
      * Known Bad Driver Alert.
@@ -144,6 +168,27 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _trainingSampleCount.value = withContext(Dispatchers.IO) { trainingCollector.sampleCount() }
         }
+        if (_telemetryEnabled.value) {
+            startHealthTelemetryLoop(marker = "APP_RESUME_LOGGING")
+        }
+    }
+
+    private fun currentSpeedMph(): Float? {
+        val loc = _currentLocation.value ?: return null
+        return if (loc.hasSpeed()) loc.speed * MPS_TO_MPH else null
+    }
+
+    private fun startHealthTelemetryLoop(marker: String) {
+        healthTelemetryJob?.cancel()
+        telemetryLogger.recordSessionMarker(marker, TelephotoAnalyzer.ANALYSIS_INTERVAL_MS, currentSpeedMph())
+        _telemetryEventCount.value = telemetryLogger.currentEventCount()
+        healthTelemetryJob = viewModelScope.launch {
+            while (true) {
+                delay(HEALTH_SNAPSHOT_INTERVAL_MS)
+                telemetryLogger.recordHealthSnapshot(currentSpeedMph())
+                _telemetryEventCount.value = telemetryLogger.currentEventCount()
+            }
+        }
     }
 
     private fun trimOldBreadcrumbs() {
@@ -159,62 +204,93 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
 
     /**
      * Called by TelephotoAnalyzer via pipeline state collection in MainActivity.
-     * When a new OCR plate is received, immediately queries Room to check if
-     * this plate was ever flagged as a bad driver — triggers the alert if so.
+     * Checks all confirmed plate tokens in the frame against Room DB so known-bad plates in
+     * adjacent lanes still trigger alerts, and manages sticky crop / alert lifecycle cleanly.
      */
     fun updateActiveDetection(
         plateOcr: String?,
         vehicleMmc: String?,
         plateBoxes: List<PlateBox> = emptyList(),
-        plateCrop: Bitmap? = null
+        plateCrop: Bitmap? = null,
+        confirmedPlates: List<String> = listOfNotNull(plateOcr),
+        frameWidth: Int = 0,
+        frameHeight: Int = 0
     ) {
         _activePlateOcr.value = plateOcr
         _activeVehicleMmc.value = vehicleMmc
         _plateBoxes.value = plateBoxes
-        // R4: the ViewModel owns published plate crops. When the analyzer hands us a new one, recycle
-        // the bitmap it replaces here (main dispatcher) rather than in the analyzer — that kept
-        // recycle and flagBadDriver()'s compress on the same thread, so a FLAG press can't race a
-        // recycle. The `!==` guard skips no-op re-emissions that carry the same bitmap reference.
+        if (frameWidth > 0 && frameHeight > 0) {
+            _frameAspectRatio.value = frameWidth.toFloat() / frameHeight.toFloat()
+        }
+
+        // R4: the ViewModel owns published plate crops on the main dispatcher.
         if (plateCrop != null) {
+            cropStickyJob?.cancel()
+            cropStickyJob = null
             val prev = _lastPlateCrop.value
             _lastPlateCrop.value = plateCrop
             if (prev != null && prev !== plateCrop && !prev.isRecycled) prev.recycle()
+        } else if (plateBoxes.isEmpty() && _lastPlateCrop.value != null && cropStickyJob == null) {
+            // Expire & recycle the held crop after 5s with no plate in view so it can never
+            // attach to an unrelated vehicle flagged later via MMC fallback.
+            cropStickyJob = viewModelScope.launch {
+                delay(5_000L)
+                val stale = _lastPlateCrop.value
+                _lastPlateCrop.value = null
+                if (stale != null && !stale.isRecycled) stale.recycle()
+                cropStickyJob = null
+            }
         }
 
-        if (plateOcr != null) {
-            // Update sticky OCR and reset the 5-second clear timer
-            _lastConfidentOcr.value = plateOcr
+        val lookupPlates = confirmedPlates.ifEmpty { listOfNotNull(plateOcr) }
+        if (lookupPlates.isNotEmpty()) {
+            val primary = plateOcr ?: lookupPlates.first()
+            _lastConfidentOcr.value = primary
             ocrStickyJob?.cancel()
             ocrStickyJob = viewModelScope.launch {
                 delay(5_000L)
                 _lastConfidentOcr.value = null
+                dismissedAlertPlateNormalized = null
             }
 
             viewModelScope.launch {
                 try {
-                    val match = dao.findBadDriverByPlate(normalizePlate(plateOcr))
-                    _knownBadDriverAlert.value = match
+                    val match = lookupPlates.firstNotNullOfOrNull { token ->
+                        dao.findBadDriverByPlate(normalizePlate(token))
+                    }
                     if (match != null) {
-                        Log.w(TAG, "⚠️ KNOWN BAD DRIVER DETECTED: $plateOcr (previously flagged at ${match.timestamp})")
-                        // Fire haptic/sound (A21) and log a sighting (A21) once per encounter.
+                        // Do not re-open if the user explicitly tapped ✕ while continuously viewing
+                        // this same vehicle.
+                        if (match.plateNormalized != dismissedAlertPlateNormalized) {
+                            _knownBadDriverAlert.value = match
+                        }
+                        Log.w(TAG, "⚠️ KNOWN BAD DRIVER DETECTED: ${match.plateOcr} (flagged at ${match.timestamp})")
                         val now = System.currentTimeMillis()
-                        val newEncounter = match.plateOcr != lastSightingPlate ||
+                        val newEncounter = match.plateNormalized != lastSightingPlate ||
                             now - lastSightingTime > SIGHTING_COOLDOWN_MS
                         if (newEncounter) {
-                            lastSightingPlate = match.plateOcr
+                            lastSightingPlate = match.plateNormalized
                             lastSightingTime = now
                             feedback.badDriverAlert()
                             insertSighting(match, now)
+                            if (_telemetryEnabled.value) {
+                                telemetryLogger.recordAction(
+                                    "BAD_DRIVER_ALERT",
+                                    "plate=${match.plateOcr ?: "unknown"}",
+                                    currentSpeedMph()
+                                )
+                                _telemetryEventCount.value = telemetryLogger.currentEventCount()
+                            }
                         }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Bad driver DB lookup failed: ${e.localizedMessage}", e)
                 }
             }
-        } else {
-            // No plate in view — clear any active alert (sticky OCR timer handles its own clear)
-            _knownBadDriverAlert.value = null
         }
+        // Note: when lookupPlates is empty (e.g. brief occlusion or plate leaves frame), do NOT
+        // immediately clear _knownBadDriverAlert — let PulsingAlertBorder's 15s timer or ✕ tap
+        // dismiss it cleanly.
     }
 
     /**
@@ -247,39 +323,53 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
 
     /** Manually dismisses the known bad driver alert (user taps ✕ or 15s auto-dismiss fires). */
     fun dismissAlert() {
+        dismissedAlertPlateNormalized = _knownBadDriverAlert.value?.plateNormalized
         _knownBadDriverAlert.value = null
-        Log.i(TAG, "Known bad driver alert dismissed by user.")
+        Log.i(TAG, "Known bad driver alert dismissed.")
     }
 
     /**
      * Triggered when the FLAG BAD DRIVER button is pressed.
-     * Captures current GPS, active OCR/MMC, battery level, and writes a Room record.
-     * Plate crop image saving will be added in Phase 3.
+     * Snapshots current OCR/MMC and a safe copy of the plate crop on Main (preserving R4
+     * single-thread ownership), then performs GPS lookup, JPEG compression, and Room insert off
+     * the main thread.
      */
     fun flagBadDriver() {
         feedback.flagPressed()
+        // Snapshot UI-thread-owned state synchronously before hopping to IO.
+        val ocr = _lastConfidentOcr.value ?: _activePlateOcr.value
+        val mmc = _activeVehicleMmc.value
+        val hasPlateContext = ocr != null || _plateBoxes.value.isNotEmpty()
+        // Copy the tiny plate crop on Main so Dispatchers.IO never races updateActiveDetection()'s recycle().
+        val cropCopy: Bitmap? = if (hasPlateContext) {
+            _lastPlateCrop.value?.takeIf { !it.isRecycled }?.let { src ->
+                try { src.copy(src.config ?: Bitmap.Config.ARGB_8888, false) } catch (_: Exception) { null }
+            }
+        } else null
+        val cachedLocation = _currentLocation.value
+
         viewModelScope.launch {
             try {
-                fetchUpdatedLocation()
-                val loc = _currentLocation.value
+                val loc = resolveLocationForFlag() ?: cachedLocation
                 val lat = loc?.latitude ?: 0.0
                 val lon = loc?.longitude ?: 0.0
-                // Use sticky OCR (holds 5s after plate leaves frame) so flag always captures last read plate
-                val ocr = _lastConfidentOcr.value ?: _activePlateOcr.value
-                val mmc = _activeVehicleMmc.value
                 val battery = batteryMonitor.getBatteryLevel()
+                val captureTime = System.currentTimeMillis()
 
-                // Save plate crop JPEG to filesDir/crops/<timestamp>.jpg
-                val cropPath = _lastPlateCrop.value?.let { bmp ->
-                    try {
-                        val cropsDir = File(getApplication<Application>().filesDir, "crops").also { it.mkdirs() }
-                        val cropFile = File(cropsDir, "${System.currentTimeMillis()}.jpg")
-                        cropFile.outputStream().use { out -> bmp.compress(Bitmap.CompressFormat.JPEG, 90, out) }
-                        Log.i(TAG, "Plate crop saved: ${cropFile.absolutePath}")
-                        cropFile.absolutePath
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Plate crop save failed: ${e.localizedMessage}", e)
-                        null
+                val cropPath = withContext(Dispatchers.IO) {
+                    cropCopy?.let { bmp ->
+                        try {
+                            val cropsDir = File(getApplication<Application>().filesDir, "crops").also { it.mkdirs() }
+                            val cropFile = File(cropsDir, "$captureTime.jpg")
+                            cropFile.outputStream().use { out -> bmp.compress(Bitmap.CompressFormat.JPEG, 90, out) }
+                            Log.i(TAG, "Plate crop saved: ${cropFile.absolutePath}")
+                            cropFile.absolutePath
+                        } catch (e: Exception) {
+                            Log.e(TAG, "Plate crop save failed: ${e.localizedMessage}", e)
+                            null
+                        } finally {
+                            if (!bmp.isRecycled) bmp.recycle()
+                        }
                     }
                 }
 
@@ -289,7 +379,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     plateOcr = ocr,
                     plateNormalized = ocr?.let { normalizePlate(it) },
                     vehicleMmc = if (ocr == null) mmc else null,
-                    timestamp = System.currentTimeMillis(),
+                    timestamp = captureTime,
                     latitude = lat,
                     longitude = lon,
                     batteryLevel = battery,
@@ -302,9 +392,41 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                 val lonStr = String.format("%.5f", lon)
                 _notificationMessage.value = "Flagged: $tag  |  GPS: [$latStr, $lonStr]  |  Bat: ${BatteryMonitor.format(battery)}"
                 Log.i(TAG, "Flagged bad driver [Row: $rowId, Tag: $tag, GPS: $lat/$lon, Battery: $battery%]")
+                if (_telemetryEnabled.value) {
+                    telemetryLogger.recordAction(
+                        "FLAG_PRESSED",
+                        "tag=$tag crop=${cropPath != null} gps=$latStr,$lonStr",
+                        currentSpeedMph()
+                    )
+                    _telemetryEventCount.value = telemetryLogger.currentEventCount()
+                }
             } catch (e: Exception) {
+                if (cropCopy != null && !cropCopy.isRecycled) cropCopy.recycle()
                 Log.e(TAG, "FLAG BUTTON — DB write failed: ${e.localizedMessage}", e)
                 _notificationMessage.value = "Save failed: ${e.localizedMessage}"
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private suspend fun resolveLocationForFlag(): Location? = withTimeoutOrNull(1_200L) {
+        suspendCancellableCoroutine { cont ->
+            locationCancellationSource.cancel()
+            locationCancellationSource = CancellationTokenSource()
+            try {
+                fusedLocationClient.getCurrentLocation(
+                    Priority.PRIORITY_HIGH_ACCURACY,
+                    locationCancellationSource.token
+                ).addOnSuccessListener { location ->
+                    if (location != null) _currentLocation.value = location
+                    if (cont.isActive) cont.resume(location)
+                }.addOnFailureListener { e ->
+                    Log.w(TAG, "Ad-hoc location query failed: ${e.localizedMessage}", e)
+                    if (cont.isActive) cont.resume(null)
+                }
+            } catch (e: SecurityException) {
+                Log.e(TAG, "Location permission missing.", e)
+                if (cont.isActive) cont.resume(null)
             }
         }
     }
@@ -322,9 +444,66 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
      * pipeline thread and must finish before the frame bitmap is recycled — onPlateDetected saves
      * synchronously, so that holds.
      */
-    fun onTrainingSample(frame: Bitmap, box: RectF) {
-        trainingCollector.onPlateDetected(frame, box)
-        _trainingSampleCount.update { it + 1 } // R6: atomic — runs on the analyzer's pipeline thread
+    fun onTrainingSample(frame: Bitmap, boxes: List<RectF>) {
+        if (trainingCollector.onPlateDetected(frame, boxes)) {
+            _trainingSampleCount.update { it + 1 } // R6: atomic — runs on the analyzer's pipeline thread
+        }
+    }
+
+    fun clearTrainingData() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { trainingCollector.clearAll() }
+            _trainingSampleCount.value = 0
+            _notificationMessage.value = "Training samples cleared."
+        }
+    }
+
+    fun toggleTelemetryLogging() {
+        val next = !_telemetryEnabled.value
+        _telemetryEnabled.value = next
+        telemetryLogger.setPersistedEnabled(next)
+        if (next) {
+            startHealthTelemetryLoop(marker = "USER_START_LOGGING")
+            _notificationMessage.value = "Field Telemetry Logging: ON"
+        } else {
+            healthTelemetryJob?.cancel()
+            healthTelemetryJob = null
+            telemetryLogger.recordSessionMarker("USER_STOP_LOGGING", TelephotoAnalyzer.ANALYSIS_INTERVAL_MS, currentSpeedMph())
+            _telemetryEventCount.value = telemetryLogger.currentEventCount()
+            _notificationMessage.value = "Field Telemetry Logging: OFF"
+        }
+    }
+
+    fun onFrameTelemetry(frame: TelephotoAnalyzer.FrameTelemetry) {
+        if (!_telemetryEnabled.value) return
+        telemetryLogger.recordFrame(frame, currentSpeedMph())
+        _telemetryEventCount.value = telemetryLogger.currentEventCount()
+    }
+
+    fun onTabSelected(tabName: String) {
+        if (!_telemetryEnabled.value) return
+        telemetryLogger.recordAction("TAB_SELECTED", "tab=$tabName", currentSpeedMph())
+        _telemetryEventCount.value = telemetryLogger.currentEventCount()
+    }
+
+    fun exportTelemetryReport() {
+        viewModelScope.launch {
+            _notificationMessage.value = "Building telemetry report…"
+            val fileName = withContext(Dispatchers.IO) { telemetryLogger.exportReportToDownloads() }
+            _notificationMessage.value = if (fileName != null) {
+                "Telemetry saved: Downloads/$fileName"
+            } else {
+                "No telemetry recorded yet."
+            }
+        }
+    }
+
+    fun clearTelemetryLogs() {
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { telemetryLogger.clearAll() }
+            _telemetryEventCount.value = 0
+            _notificationMessage.value = "Telemetry logs cleared."
+        }
     }
 
     /**
@@ -357,8 +536,16 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
 
     fun deleteLogItem(log: DriverLog) {
         viewModelScope.launch {
-            try { dao.safeDeleteLog(log) }
-            catch (e: Exception) { Log.e(TAG, "Delete log ${log.id} failed: ${e.localizedMessage}", e) }
+            try {
+                dao.safeDeleteLog(log)
+                log.plateCropPath?.let { path ->
+                    withContext(Dispatchers.IO) {
+                        try { File(path).delete() } catch (_: Exception) {}
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Delete log ${log.id} failed: ${e.localizedMessage}", e)
+            }
         }
     }
 
@@ -367,6 +554,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
             try {
                 dao.safeClearAllLogs()
                 dao.safeClearAllLocationRecords()
+                withContext(Dispatchers.IO) {
+                    File(getApplication<Application>().filesDir, "crops").deleteRecursively()
+                }
                 _notificationMessage.value = "All records cleared."
             } catch (e: Exception) {
                 Log.e(TAG, "Clear all failed: ${e.localizedMessage}", e)
@@ -412,7 +602,14 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         super.onCleared()
         locationCancellationSource.cancel()
+        ocrStickyJob?.cancel()
+        cropStickyJob?.cancel()
+        healthTelemetryJob?.cancel()
+        val crop = _lastPlateCrop.value
+        _lastPlateCrop.value = null
+        if (crop != null && !crop.isRecycled) crop.recycle()
         feedback.release()
+        telemetryLogger.release()
         try { fusedLocationClient.removeLocationUpdates(locationCallback) }
         catch (e: Exception) { Log.e(TAG, "Failed to remove location callback: ${e.localizedMessage}", e) }
     }
@@ -422,5 +619,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
 
         // Same known-bad plate within this window counts as one encounter (one buzz + one sighting).
         private const val SIGHTING_COOLDOWN_MS = 30_000L
+        private const val HEALTH_SNAPSHOT_INTERVAL_MS = 15_000L
+        private const val MPS_TO_MPH = 2.2369363f
     }
 }

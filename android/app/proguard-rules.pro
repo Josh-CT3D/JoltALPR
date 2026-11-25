@@ -1,10 +1,17 @@
 # Add project specific ProGuard rules here.
-# By default, the flags in this file are appended to flags specified
-# in C:\Users\jmhin\AppData\Local\Android\Sdk/tools/proguard/proguard-android.txt
-# You can edit the include path and order by changing the proguardFiles
-# directive in build.gradle.kts.
-#
-# For more details, see
-#   http://developer.android.com/guide/developing/tools-proguard.html
 
-# Add any custom Keep rules here:
+# TensorFlow Lite / GPU delegate JNI bindings
+-keep class org.tensorflow.lite.** { *; }
+-dontwarn org.tensorflow.lite.**
+
+# ML Kit bundled text recognition
+-keep class com.google.mlkit.** { *; }
+-dontwarn com.google.mlkit.**
+
+# Room entities / generated DAOs
+-keep class com.ct3d.jolt.data.** { *; }
+-keepclassmembers class * extends androidx.room.RoomDatabase { *; }
+
+# OSMDroid tile providers & reflection
+-keep class org.osmdroid.** { *; }
+-dontwarn org.osmdroid.**

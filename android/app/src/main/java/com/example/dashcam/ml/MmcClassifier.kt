@@ -36,6 +36,13 @@ class MmcClassifier(private val context: Context) {
 
     data class Prediction(val label: String, val confidence: Float)
 
+    data class DetailedPrediction(
+        val published: Prediction?,
+        val top1Label: String,
+        val top1Confidence: Float,
+        val top3Summary: String
+    )
+
     private var interpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
     private var labels: List<String> = emptyList()
@@ -43,6 +50,10 @@ class MmcClassifier(private val context: Context) {
     /** True once initialize() has run and the model+labels actually loaded. */
     @Volatile
     var isAvailable: Boolean = false
+        private set
+
+    @Volatile
+    var isUsingGpuDelegate: Boolean = false
         private set
 
     private val inputSize = 224
@@ -122,12 +133,14 @@ class MmcClassifier(private val context: Context) {
             val delegate = GpuDelegate(GpuDelegate.Options().apply { setPrecisionLossAllowed(true) })
             gpuDelegate = delegate
             val gpuInterpreter = Interpreter(modelBuffer, Interpreter.Options().apply { addDelegate(delegate) })
+            isUsingGpuDelegate = true
             Log.i(TAG, "MMC GPU delegate enabled")
             return gpuInterpreter
         } catch (e: Exception) {
             Log.w(TAG, "MMC GPU delegate unavailable, CPU fallback: ${e.message}")
             gpuDelegate?.close()
             gpuDelegate = null
+            isUsingGpuDelegate = false
         }
         val cpuInterpreter = Interpreter(modelBuffer, Interpreter.Options().apply { setNumThreads(4) })
         Log.i(TAG, "MMC model loaded — CPU, 4 threads")
@@ -141,7 +154,15 @@ class MmcClassifier(private val context: Context) {
      * MUST run on the `jolt-pipeline` thread (see class kdoc).
      */
     @Synchronized
-    fun classify(bitmap: Bitmap, minConfidence: Float = MIN_MMC_CONFIDENCE): Prediction? {
+    fun classify(bitmap: Bitmap, minConfidence: Float = MIN_MMC_CONFIDENCE): Prediction? =
+        classifyDetailed(bitmap, minConfidence)?.published
+
+    /**
+     * Same as [classify], but also returns the top-1/top-3 score breakdown even when below
+     * [minConfidence] so field telemetry can evaluate O9 crop accuracy and tune the confidence floor.
+     */
+    @Synchronized
+    fun classifyDetailed(bitmap: Bitmap, minConfidence: Float = MIN_MMC_CONFIDENCE): DetailedPrediction? {
         val tflite = interpreter ?: return null
         if (bitmap.isRecycled) {
             Log.w(TAG, "classify() got a recycled bitmap — skipping")
@@ -155,20 +176,27 @@ class MmcClassifier(private val context: Context) {
             val logits = outputBuffer[0]
             val probs = softmax(logits)
 
-            // Log top-3 so field misclassifications are diagnosable from a logcat capture.
             val top3 = probs.indices.sortedByDescending { probs[it] }.take(3)
-            Log.d(TAG, "MMC top3: " + top3.joinToString(", ") {
+            val summary = top3.joinToString("; ") {
                 "${displayLabel(labels[it])}=${"%.3f".format(probs[it])}"
-            })
+            }
+            Log.d(TAG, "MMC top3: $summary")
 
             val bestIdx = top3.first()
+            val bestLabel = displayLabel(labels[bestIdx])
             val confidence = probs[bestIdx]
-            if (confidence < minConfidence) {
+            val published = if (confidence < minConfidence) {
                 Log.d(TAG, "MMC below floor ($confidence < $minConfidence) — no fallback shown")
                 null
             } else {
-                Prediction(displayLabel(labels[bestIdx]), confidence)
+                Prediction(bestLabel, confidence)
             }
+            DetailedPrediction(
+                published = published,
+                top1Label = bestLabel,
+                top1Confidence = confidence,
+                top3Summary = summary
+            )
         } catch (e: Exception) {
             Log.e(TAG, "MMC inference failed: ${e.message}", e)
             null
@@ -236,6 +264,7 @@ class MmcClassifier(private val context: Context) {
         gpuDelegate = null
         if (::resizedBitmap.isInitialized && !resizedBitmap.isRecycled) resizedBitmap.recycle()
         isAvailable = false
+        isUsingGpuDelegate = false
         Log.i(TAG, "MmcClassifier closed")
     }
 

@@ -15,8 +15,11 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.resume
 
 /**
  * Immutable plate box in fractional (0..1) frame coordinates, drawn by the UI overlay.
@@ -52,6 +55,9 @@ class TelephotoAnalyzer(
     data class PipelineState(
         val activePlateocr: String? = null,
         val activeVehicleMmc: String? = null,
+        // All voted plate tokens confirmed in the current frame (supports multi-plate scenes
+        // so a known-bad plate in an adjacent lane still triggers alerts).
+        val confirmedPlateTokens: List<String> = emptyList(),
         val fpsTimestamp: Long = 0L,
         val processingTimeMs: Long = 0,
         val lastStatusMessage: String = "Pipeline Idle",
@@ -59,6 +65,9 @@ class TelephotoAnalyzer(
         // The UI draws green overlay rectangles from these. Immutable PlateBox (not RectF) keeps
         // this state Compose-stable so the Main screen doesn't recompose every frame.
         val plateBoxes: List<PlateBox> = emptyList(),
+        // Analyzed frame dimensions for accurate FILL_CENTER bounding-box projection in the UI.
+        val frameWidth: Int = 0,
+        val frameHeight: Int = 0,
         // Most recent successful plate crop bitmap (upscaled). Null when no plate in view.
         val lastPlateCrop: Bitmap? = null
     )
@@ -78,17 +87,38 @@ class TelephotoAnalyzer(
     // frame that takes longer than ANALYSIS_INTERVAL_MS would otherwise queue unboundedly. Drop
     // any frame that arrives while the pipeline is still draining the previous one.
     private val pipelineBusy = AtomicBoolean(false)
+    private val busyDropsSinceLastFrame = AtomicInteger(0)
+    private var previousExecutedFrameAtMs = 0L
 
     // A15: multi-frame OCR voting. A single ML Kit misread (LT2379 -> LT2879) must not immediately
-    // become the active plate and fire a false known-bad-driver alert. We keep a rolling window of
-    // the last VOTE_WINDOW token reads and only publish a token once it has appeared at least
-    // VOTE_MIN_COUNT times. Guarded by voteLock because reads happen on the ML Kit callback thread
-    // while resets happen on the pipeline dispatcher.
-    private val voteLock = Any()
-    private val recentTokens = ArrayDeque<String>()
+    // become the active plate and fire a false known-bad-driver alert.
+    private val voteBuffer = OcrVoteBuffer(VOTE_WINDOW, VOTE_MIN_COUNT)
 
-    // Phase 6: set this callback to receive (fullFrameBitmap, plateBox) for training data collection
-    var trainingCallback: ((Bitmap, RectF) -> Unit)? = null
+    // Phase 6: receives (fullFrameBitmap, allConfidentBoxes) for training data collection
+    var trainingCallback: ((Bitmap, List<RectF>) -> Unit)? = null
+
+    // Field validation telemetry callback — invoked on jolt-pipeline after each analyzed frame.
+    var frameTelemetryCallback: ((FrameTelemetry) -> Unit)? = null
+
+    data class FrameTelemetry(
+        val timestampMs: Long,
+        val frameDeltaMs: Long,
+        val busyDrops: Int,
+        val totalMs: Long,
+        val yoloMs: Long,
+        val ocrMs: Long,
+        val mmcMs: Long,
+        val yoloGpu: Boolean,
+        val mmcGpu: Boolean,
+        val plateBoxCount: Int,
+        val topPlateConf: Float,
+        val ocrTokens: List<String>,
+        val consensusPlate: String?,
+        val mmcTrigger: String,
+        val mmcPublished: String?,
+        val mmcTop1Conf: Float,
+        val mmcTop3: String?
+    )
 
     // Lazy ML Kit Latin OCR client (bundled — works fully offline)
     private val ocrRecognizer by lazy {
@@ -134,6 +164,7 @@ class TelephotoAnalyzer(
         // R2: drop this frame if the previous one is still being processed (serial pipeline).
         // Reset in the coroutine's finally below.
         if (!pipelineBusy.compareAndSet(false, true)) {
+            busyDropsSinceLastFrame.incrementAndGet()
             image.close()
             return
         }
@@ -160,17 +191,42 @@ class TelephotoAnalyzer(
 
         uiScope.launch(frameDispatcher) {
             val startTime = System.currentTimeMillis()
+            val frameDelta = if (previousExecutedFrameAtMs > 0L) startTime - previousExecutedFrameAtMs else 0L
+            previousExecutedFrameAtMs = startTime
+            val droppedWhileBusy = busyDropsSinceLastFrame.getAndSet(0)
             try {
                 _pipelineState.value = _pipelineState.value.copy(
                     fpsTimestamp = currentMillis,
                     lastStatusMessage = "Analyzing frame..."
                 )
 
-                executeHybridMlPipeline(bitmap)
+                val metrics = executeHybridMlPipeline(bitmap)
 
                 val elapsed = System.currentTimeMillis() - startTime
                 Log.d(TAG, "Pipeline completed in ${elapsed}ms")
                 _pipelineState.value = _pipelineState.value.copy(processingTimeMs = elapsed)
+
+                frameTelemetryCallback?.invoke(
+                    FrameTelemetry(
+                        timestampMs    = startTime,
+                        frameDeltaMs   = frameDelta,
+                        busyDrops      = droppedWhileBusy,
+                        totalMs        = elapsed,
+                        yoloMs         = metrics.yoloMs,
+                        ocrMs          = metrics.ocrMs,
+                        mmcMs          = metrics.mmcMs,
+                        yoloGpu        = yoloDetector.isUsingGpuDelegate,
+                        mmcGpu         = mmcClassifier.isUsingGpuDelegate,
+                        plateBoxCount  = metrics.plateBoxCount,
+                        topPlateConf   = metrics.topPlateConf,
+                        ocrTokens      = metrics.ocrTokens,
+                        consensusPlate = metrics.consensusPlate,
+                        mmcTrigger     = metrics.mmcTrigger,
+                        mmcPublished   = metrics.mmcPublished,
+                        mmcTop1Conf    = metrics.mmcTop1Conf,
+                        mmcTop3        = metrics.mmcTop3
+                    )
+                )
 
             } catch (e: Exception) {
                 Log.e(TAG, "Pipeline exception: ${e.localizedMessage}", e)
@@ -183,74 +239,94 @@ class TelephotoAnalyzer(
         }
     }
 
+    private data class PipelineMetrics(
+        val yoloMs: Long = 0L,
+        val ocrMs: Long = 0L,
+        val mmcMs: Long = 0L,
+        val plateBoxCount: Int = 0,
+        val topPlateConf: Float = 0f,
+        val ocrTokens: List<String> = emptyList(),
+        val consensusPlate: String? = null,
+        val mmcTrigger: String = "NONE",
+        val mmcPublished: String? = null,
+        val mmcTop1Conf: Float = 0f,
+        val mmcTop3: String? = null
+    )
+
     /**
      * Phase 2 pipeline — single-class license plate detection.
      * 1. Run YOLOv8 on the full frame (A6: no ROI crop — see the note in this method's body).
      * 2a. Plate found → compute fractional overlay boxes → crop → ML Kit OCR.
      * 2b. No plate    → clear display (Option A).
      */
-    private suspend fun executeHybridMlPipeline(frameBitmap: Bitmap) {
-        // A6 decision: use the FULL frame — do not crop to a bottom ROI.
-        // The old bottom-65% ROI was a wide-angle-dashcam optimization to drop sky/buildings.
-        // With the 5× telephoto's tight FOV aimed at same-direction traffic, target plates
-        // routinely sit high in the frame (distant vehicles ahead), so cropping the top would cut
-        // them off — bad for detection rate (priority #2). After A1–A3, full-frame inference is
-        // fast enough that ROI's ~2.1× area saving is unnecessary. cropRoi() deleted as dead code.
+    private suspend fun executeHybridMlPipeline(frameBitmap: Bitmap): PipelineMetrics {
         val roiBitmap = frameBitmap
+        val validPlates: List<Detection>
+        val trainingBoxes: List<RectF>
+        // Per-plate OCR inputs prepared synchronously while roiBitmap is alive.
+        data class PlateCandidate(val det: Detection, val ocrCrop: Bitmap, val persistCrop: Bitmap)
+        val candidates = mutableListOf<PlateCandidate>()
+        var mmcFallback: Bitmap? = null
+        var yoloElapsedMs = 0L
+        var mmcElapsedMs = 0L
+        var mmcTrigger = "NONE"
+        var mmcDetail: MmcClassifier.DetailedPrediction? = null
+        var boxCount = 0
+        var topConf = 0f
+
         try {
-            _pipelineState.value = _pipelineState.value.copy(lastStatusMessage = "Scanning...")
+            _pipelineState.value = _pipelineState.value.copy(
+                lastStatusMessage = "Scanning...",
+                frameWidth = roiBitmap.width,
+                frameHeight = roiBitmap.height
+            )
+            val yoloStart = System.currentTimeMillis()
             val detections = runYoloDetection(roiBitmap)
+            yoloElapsedMs = System.currentTimeMillis() - yoloStart
             Log.d(TAG, "YOLO: ${detections.size} plate detections (threshold 0.25)")
 
-            val bestPlate = detections.filter { it.confidence > 0.25f }
-                                      .maxByOrNull { it.confidence }
+            validPlates = detections
+                .filter { it.confidence > 0.25f }
+                .sortedByDescending { it.confidence }
+                .take(MAX_OCR_PLATES_PER_FRAME)
+            boxCount = validPlates.size
+            topConf = validPlates.firstOrNull()?.confidence ?: 0f
 
-            if (bestPlate != null) {
-                val fractionalBoxes = computeFractionalBoxes(
-                    detections.filter { it.confidence > 0.25f }, roiBitmap
-                )
+            if (validPlates.isNotEmpty()) {
+                val fractionalBoxes = computeFractionalBoxes(validPlates, roiBitmap)
                 _pipelineState.value = _pipelineState.value.copy(
                     plateBoxes = fractionalBoxes,
                     lastStatusMessage = "Plate found — running OCR..."
                 )
 
+                val bestPlate = validPlates.first()
                 Log.d(TAG, "Best plate box: left=${bestPlate.box.left} top=${bestPlate.box.top} " +
                            "right=${bestPlate.box.right} bottom=${bestPlate.box.bottom} " +
                            "conf=${bestPlate.confidence}  ROI=${roiBitmap.width}×${roiBitmap.height}")
-                val plateCrop = cropBitmapToDetection(roiBitmap, bestPlate.box)
-                if (plateCrop != null) {
-                    // A19: collect high-confidence frames for training (callback no-ops if training
-                    // mode is off). Synchronous — completes before frameBitmap is recycled.
-                    if (bestPlate.confidence >= TRAINING_MIN_CONFIDENCE) {
-                        trainingCallback?.invoke(roiBitmap, bestPlate.box)
+
+                // A19: collect high-confidence frames with ALL confident boxes in frame so YOLO
+                // training labels don't omit secondary visible plates.
+                trainingBoxes = detections
+                    .filter { it.confidence >= TRAINING_MIN_CONFIDENCE }
+                    .map { it.box }
+                if (trainingBoxes.isNotEmpty()) {
+                    trainingCallback?.invoke(roiBitmap, trainingBoxes)
+                }
+
+                for (det in validPlates) {
+                    val rawCrop = cropBitmapToDetection(roiBitmap, det.box) ?: continue
+                    val ocrCrop = upscaleCrop(rawCrop)
+                    val persistCopy = upscaleCrop(rawCrop)
+                    rawCrop.recycle()
+                    candidates.add(PlateCandidate(det, ocrCrop, persistCopy))
+                }
+
+                if (candidates.isNotEmpty()) {
+                    if (mmcClassifier.isAvailable) {
+                        mmcFallback = buildMmcInput(roiBitmap, bestPlate.box)
                     }
-
-                    // Two independent upscaled copies: one owned by OCR (recycled in the ML Kit
-                    // callback), one persisted for FLAG-save. Keeping them separate means recycling
-                    // one never pulls the pixels out from under the other.
-                    val ocrCrop = upscaleCrop(plateCrop)
-                    val persistCrop = upscaleCrop(plateCrop)
-                    plateCrop.recycle() // A4(c): raw crop is consumed once both upscales are made
-
-                    // R4: publish the persisted crop but do NOT recycle the previous one here. The
-                    // ViewModel owns published crops and recycles the prior bitmap when a new one
-                    // arrives in updateActiveDetection(). Recycling here raced flagBadDriver()'s
-                    // compress on the main thread and could null out the saved evidence photo;
-                    // ownership transfer keeps recycle and read/compress on the same (main) thread.
-                    _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = persistCrop)
-
-                    // Phase 5 trigger (b): OCR may still fail to yield a usable token. ML Kit is
-                    // async and its callbacks land on the MAIN thread, by which point frameBitmap
-                    // has already been recycled by our finally block — so snapshot a small 224²
-                    // copy (~200 KB) NOW and hand it to the OCR call. Scoped to this invocation,
-                    // so overlapping frames can't race over a shared field.
-                    // O9: anchor the MMC crop to the plate box — it's the best vehicle-position
-                    // estimate we have, and it's free.
-                    val mmcFallback =
-                        if (mmcClassifier.isAvailable) buildMmcInput(roiBitmap, bestPlate.box) else null
-                    runMlKitOcr(ocrCrop, mmcFallback) // takes ownership of both
                 } else {
-                    Log.w(TAG, "Plate crop null — clearing display.")
+                    Log.w(TAG, "All plate crops null — clearing display.")
                     clearDetectionState()
                 }
             } else {
@@ -260,17 +336,141 @@ class TelephotoAnalyzer(
                 resetVoteBuffer() // plate left frame — start voting fresh for the next one
                 clearDetectionState()
                 if (mmcClassifier.isAvailable) {
-                    // O9: no plate box to anchor to — centre square crop (see buildMmcInput).
-                    classifyAndPublishMmc(buildMmcInput(roiBitmap))
+                    mmcTrigger = "NO_PLATE_CENTER"
+                    val mmcStart = System.currentTimeMillis()
+                    mmcDetail = classifyAndPublishMmc(buildMmcInput(roiBitmap))
+                    mmcElapsedMs = System.currentTimeMillis() - mmcStart
                 }
             }
         } finally {
-            // A4(b): the full frame is fully consumed here — YOLO copies it into its own scratch
-            // bitmap, crops are taken synchronously — so recycle it every path to stop frames
-            // piling up over multi-hour drives. (roiBitmap === frameBitmap while ROI crop is off.)
+            // A4(b): all crops/snapshots are already taken synchronously — recycle full frame now.
             if (!frameBitmap.isRecycled) frameBitmap.recycle()
         }
+
+        if (candidates.isEmpty()) {
+            recycleQuietly(mmcFallback)
+            return PipelineMetrics(
+                yoloMs        = yoloElapsedMs,
+                mmcMs         = mmcElapsedMs,
+                plateBoxCount = boxCount,
+                topPlateConf  = topConf,
+                mmcTrigger    = mmcTrigger,
+                mmcPublished  = mmcDetail?.published?.label,
+                mmcTop1Conf   = mmcDetail?.top1Confidence ?: 0f,
+                mmcTop3       = mmcDetail?.top3Summary
+            )
+        }
+
+        // Run ML Kit OCR sequentially across the cropped candidates, resuming back onto
+        // frameDispatcher (jolt-pipeline). Running sequentially before returning keeps R1/R2/C1
+        // ordered by construction (no stale frame N callback overwriting frame N+1).
+        val extracted = mutableListOf<Pair<PlateCandidate, String>>()
+        val ocrStart = System.currentTimeMillis()
+        try {
+            for (candidate in candidates) {
+                val raw = processOcr(candidate.ocrCrop)
+                val clean = raw?.uppercase()?.filter { it.isLetterOrDigit() || it == ' ' } ?: ""
+                val token = if (clean.isNotEmpty()) extractPlateToken(clean) else null
+                if (token != null) {
+                    extracted.add(candidate to token)
+                }
+            }
+        } finally {
+            // Ensure every OCR crop is recycled even on cancellation/exception.
+            for (c in candidates) recycleQuietly(c.ocrCrop)
+        }
+        val ocrElapsedMs = System.currentTimeMillis() - ocrStart
+
+        if (extracted.isNotEmpty()) {
+            recycleQuietly(mmcFallback)
+            val chosenPersist = extracted.first().first.persistCrop
+            for (c in candidates) {
+                if (c.persistCrop !== chosenPersist) recycleQuietly(c.persistCrop)
+            }
+            // R4: hand ownership of chosenPersist to the ViewModel (never recycle here).
+            _pipelineState.value = _pipelineState.value.copy(lastPlateCrop = chosenPersist)
+
+            val tokensInFrame = extracted.map { it.second }
+            val voteResult = registerAndVoteFrame(tokensInFrame)
+            val consensus = voteResult.primaryConsensus
+            if (consensus != null) {
+                Log.i(TAG, "OCR consensus: '$consensus' (frame tokens=$tokensInFrame, confirmed=${voteResult.confirmedTokens})")
+                _pipelineState.value = _pipelineState.value.copy(
+                    activePlateocr       = consensus,
+                    confirmedPlateTokens = voteResult.confirmedTokens,
+                    activeVehicleMmc     = null,
+                    lastStatusMessage    = "OCR: $consensus"
+                )
+            } else {
+                val pending = tokensInFrame.first()
+                Log.d(TAG, "OCR pending consensus: '$pending' (frame tokens=$tokensInFrame)")
+                _pipelineState.value = _pipelineState.value.copy(
+                    activeVehicleMmc     = null, // C5: clear stale MMC while confirming plate
+                    confirmedPlateTokens = emptyList(),
+                    lastStatusMessage    = "OCR (confirming): $pending"
+                )
+            }
+            return PipelineMetrics(
+                yoloMs         = yoloElapsedMs,
+                ocrMs          = ocrElapsedMs,
+                plateBoxCount  = boxCount,
+                topPlateConf   = topConf,
+                ocrTokens      = tokensInFrame,
+                consensusPlate = consensus
+            )
+        } else {
+            // Path (b): plate box(es) present, OCR yielded no usable plate token.
+            // Publish the primary box's crop (photo of the unreadable/obscured plate) and run MMC.
+            val fallbackPersist = candidates.first().persistCrop
+            for (c in candidates) {
+                if (c.persistCrop !== fallbackPersist) recycleQuietly(c.persistCrop)
+            }
+            _pipelineState.value = _pipelineState.value.copy(
+                activePlateocr       = null,
+                confirmedPlateTokens = emptyList(),
+                lastPlateCrop        = fallbackPersist,
+                lastStatusMessage    = "Plate unreadable — trying MMC fallback..."
+            )
+            if (mmcFallback != null) {
+                mmcTrigger = "OCR_FAIL_ANCHORED"
+                val mmcStart = System.currentTimeMillis()
+                mmcDetail = classifyAndPublishMmc(mmcFallback)
+                mmcElapsedMs = System.currentTimeMillis() - mmcStart
+            }
+            return PipelineMetrics(
+                yoloMs        = yoloElapsedMs,
+                ocrMs         = ocrElapsedMs,
+                mmcMs         = mmcElapsedMs,
+                plateBoxCount = boxCount,
+                topPlateConf  = topConf,
+                mmcTrigger    = mmcTrigger,
+                mmcPublished  = mmcDetail?.published?.label,
+                mmcTop1Conf   = mmcDetail?.top1Confidence ?: 0f,
+                mmcTop3       = mmcDetail?.top3Summary
+            )
+        }
     }
+
+    /**
+     * Suspends on ML Kit Text Recognition for [plateBitmap] and resumes on the caller's
+     * dispatcher (`jolt-pipeline`), recycling [plateBitmap] on completion.
+     */
+    private suspend fun processOcr(plateBitmap: Bitmap): String? =
+        suspendCancellableCoroutine { cont ->
+            val inputImage = InputImage.fromBitmap(plateBitmap, 0)
+            ocrRecognizer.process(inputImage)
+                .addOnCompleteListener {
+                    recycleQuietly(plateBitmap)
+                }
+                .addOnSuccessListener { visionText ->
+                    val raw = visionText.text.trim().replace("\n", " ").ifEmpty { null }
+                    if (cont.isActive) cont.resume(raw)
+                }
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "ML Kit OCR failed: ${e.localizedMessage}", e)
+                    if (cont.isActive) cont.resume(null)
+                }
+        }
 
     /**
      * Upscale a plate crop to ML Kit's ~128px minimum, ALWAYS returning a new bitmap the caller
@@ -291,45 +491,19 @@ class TelephotoAnalyzer(
 
     private fun clearDetectionState() {
         _pipelineState.value = _pipelineState.value.copy(
-            activePlateocr   = null,
-            activeVehicleMmc = null,
-            plateBoxes       = emptyList(),
-            lastStatusMessage = "Scanning..."
+            activePlateocr       = null,
+            activeVehicleMmc     = null,
+            confirmedPlateTokens = emptyList(),
+            plateBoxes           = emptyList(),
+            lastPlateCrop        = null, // R4: do NOT recycle here; ViewModel owns published crops
+            lastStatusMessage    = "Scanning..."
         )
     }
 
-    /**
-     * A15: add a token to the rolling vote window and return the consensus token — the most
-     * frequent token in the window, but only once it has appeared at least VOTE_MIN_COUNT times.
-     * Returns null while no token has enough agreement yet.
-     */
-    private fun registerAndVote(token: String): String? = synchronized(voteLock) {
-        recentTokens.addLast(token)
-        while (recentTokens.size > VOTE_WINDOW) recentTokens.removeFirst()
-        // Consensus = the most-voted token; ties are broken toward the more plate-plausible token
-        // (A17 scoring boost — vote count still dominates, nothing is hard-rejected).
-        val best = recentTokens.groupingBy { it }.eachCount().entries
-            .maxWithOrNull(compareBy({ it.value }, { plateFormatScore(it.key) }))
-            ?: return@synchronized null
-        if (best.value >= VOTE_MIN_COUNT) best.key else null
-    }
+    private fun registerAndVoteFrame(tokensInFrame: List<String>): VoteResult =
+        voteBuffer.registerFrame(tokensInFrame)
 
-    /**
-     * A17: loose US-plate plausibility, used only as a voting tiebreaker (never a hard filter).
-     * US formats vary wildly by state, so this stays permissive: it just declines to boost a
-     * token that's a run of digits with a single stray letter (e.g. "1234567X"), which is a rare
-     * real plate and a common OCR artifact. Returns 1 for plausible, 0 otherwise.
-     */
-    private fun plateFormatScore(token: String): Int {
-        // Tokens are already pre-filtered upstream to length 5–8 with >=1 digit and >=1 letter
-        // (see runMlKitOcr), so the only real discriminator left is the digit-heavy artifact case.
-        val letters = token.count { it.isLetter() }
-        val digits  = token.count { it.isDigit() }
-        if (letters == 1 && digits >= 6) return 0
-        return 1
-    }
-
-    private fun resetVoteBuffer() = synchronized(voteLock) { recentTokens.clear() }
+    private fun resetVoteBuffer() = voteBuffer.reset()
 
     /** Map detection boxes from frame pixel space to fractions (0.0–1.0) for the UI overlay. */
     private fun computeFractionalBoxes(detections: List<Detection>, roiBitmap: Bitmap): List<PlateBox> {
@@ -343,73 +517,6 @@ class TelephotoAnalyzer(
                 det.box.bottom / roiH
             )
         }
-    }
-
-    /**
-     * Runs ML Kit OCR on an already-upscaled plate crop. Takes ownership of [plateBitmap]: ML Kit
-     * reads it asynchronously, so it must not be recycled until the task completes — the
-     * completion listener recycles it (covers both success and failure).
-     *
-     * Also takes ownership of [mmcFallback] (Phase 5): a 224² snapshot of the frame, captured
-     * before the frame was recycled, used only if OCR fails to produce a usable plate token.
-     * Every branch below either recycles it or hands it to [dispatchMmcFallback], which does.
-     */
-    private fun runMlKitOcr(plateBitmap: Bitmap, mmcFallback: Bitmap? = null) {
-        val inputImage = InputImage.fromBitmap(plateBitmap, 0)
-        ocrRecognizer.process(inputImage)
-            .addOnCompleteListener {
-                if (!plateBitmap.isRecycled) plateBitmap.recycle()
-            }
-            .addOnSuccessListener { visionText ->
-                val raw = visionText.text.trim().replace("\n", " ")
-                if (raw.isNotEmpty()) {
-                    val clean = raw.uppercase().filter { it.isLetterOrDigit() || it == ' ' }
-                    // US plates are 5–8 alphanumeric chars. ML Kit reads the full plate face
-                    // including state name ("CONNECTICUT LT2379 CONSTITUTION STATE"), so we
-                    // scan each space-delimited token for the one that looks like a plate number:
-                    // 5–8 chars, contains at least one digit and at least one letter.
-                    val plateToken = clean.split(" ").firstOrNull { token ->
-                        token.length in 5..8 &&
-                        token.any { it.isDigit() } &&
-                        token.any { it.isLetter() }
-                    }
-                    if (plateToken != null) {
-                        // The plate is readable, so the MMC fallback isn't needed either way —
-                        // whether or not the vote has converged yet.
-                        recycleQuietly(mmcFallback)
-                        // A15: only publish once the token wins a vote across recent frames.
-                        val consensus = registerAndVote(plateToken)
-                        if (consensus != null) {
-                            Log.i(TAG, "OCR consensus: '$consensus'  (this read: '$plateToken', full: '$clean')")
-                            _pipelineState.value = _pipelineState.value.copy(
-                                activePlateocr    = consensus,
-                                activeVehicleMmc  = null,
-                                lastStatusMessage = "OCR: $consensus"
-                            )
-                        } else {
-                            // Accepted into the vote window but not yet confirmed — don't touch
-                            // activePlateocr (prevents a single misread firing a known-bad alert).
-                            Log.d(TAG, "OCR pending consensus: '$plateToken' (full: '$clean')")
-                            _pipelineState.value = _pipelineState.value.copy(
-                                lastStatusMessage = "OCR (confirming): $plateToken"
-                            )
-                        }
-                    } else {
-                        Log.w(TAG, "OCR '$clean' — no plate-like token found; trying MMC fallback.")
-                        clearDetectionState()
-                        dispatchMmcFallback(mmcFallback)
-                    }
-                } else {
-                    Log.w(TAG, "ML Kit returned empty; trying MMC fallback.")
-                    clearDetectionState()
-                    dispatchMmcFallback(mmcFallback)
-                }
-            }
-            .addOnFailureListener { e ->
-                Log.e(TAG, "ML Kit OCR failed: ${e.localizedMessage}", e)
-                clearDetectionState()
-                dispatchMmcFallback(mmcFallback)
-            }
     }
 
     // ── Phase 5: MMC fallback ──────────────────────────────────────────────────────────────────
@@ -480,44 +587,32 @@ class TelephotoAnalyzer(
     }
 
     /**
-     * Hop from the ML Kit callback (main thread) back onto the pipeline thread before touching the
-     * classifier. R1: the TFLite GPU delegate's EGL context is bound to `jolt-pipeline`, so running
-     * inference on the main thread would throw and be swallowed — and it would jank the UI besides.
-     */
-    private fun dispatchMmcFallback(mmcFallback: Bitmap?) {
-        val bmp = mmcFallback ?: return
-        uiScope.launch(frameDispatcher) { classifyAndPublishMmc(bmp) }
-    }
-
-    /**
      * Classify [vehicleBitmap] and publish the result as the MMC fallback. Takes ownership of the
-     * bitmap and always recycles it. MUST run on the pipeline thread (see [dispatchMmcFallback]).
+     * bitmap and always recycles it. MUST run on the `jolt-pipeline` thread.
      *
      * Leaves state untouched when the classifier declines (below confidence floor / unavailable) —
      * callers have already cleared the display, so "no guess" simply shows nothing.
      */
-    private fun classifyAndPublishMmc(vehicleBitmap: Bitmap) {
-        try {
-            // C1 stale-fallback guard. Path (b) is inherently reorderable: this task was queued from
-            // an ML Kit callback for frame N, and frame N+1 may already have published a plate
-            // consensus by the time it runs. Publishing anyway would null a live activePlateocr —
-            // which DashcamViewModel.updateActiveDetection reads as "no plate in view" and uses to
-            // CLEAR _knownBadDriverAlert, blinking out an active known-bad border. A plate we can
-            // actually read always beats a guess, so if one is on screen, this fallback lost the
-            // race and is dropped. Safe to check here: both writers run on the pipeline thread.
+    private fun classifyAndPublishMmc(vehicleBitmap: Bitmap): MmcClassifier.DetailedPrediction? {
+        return try {
             if (_pipelineState.value.activePlateocr != null) {
                 Log.d(TAG, "MMC fallback dropped — a plate consensus is already displayed")
-                return
+                return null
             }
-            val prediction = mmcClassifier.classify(vehicleBitmap) ?: return
-            Log.i(TAG, "MMC fallback: ${prediction.label} (conf=${"%.3f".format(prediction.confidence)})")
-            _pipelineState.value = _pipelineState.value.copy(
-                activePlateocr    = null,   // mutually exclusive with MMC (DriverLog stores one or the other)
-                activeVehicleMmc  = prediction.label,
-                lastStatusMessage = "MMC: ${prediction.label}"
-            )
+            val detail = mmcClassifier.classifyDetailed(vehicleBitmap) ?: return null
+            val prediction = detail.published
+            if (prediction != null) {
+                Log.i(TAG, "MMC fallback: ${prediction.label} (conf=${"%.3f".format(prediction.confidence)})")
+                _pipelineState.value = _pipelineState.value.copy(
+                    activePlateocr    = null,   // mutually exclusive with MMC (DriverLog stores one or the other)
+                    activeVehicleMmc  = prediction.label,
+                    lastStatusMessage = "MMC: ${prediction.label}"
+                )
+            }
+            detail
         } catch (e: Exception) {
             Log.e(TAG, "MMC fallback failed: ${e.localizedMessage}", e)
+            null
         } finally {
             recycleQuietly(vehicleBitmap)
         }
@@ -650,5 +745,92 @@ class TelephotoAnalyzer(
         private const val MMC_CROP_WIDTH_MULT = 6.0f
         private const val MMC_CROP_UP_MULT    = 4.5f
         private const val MMC_CROP_DOWN_MULT  = 1.5f
+
+        private const val MAX_OCR_PLATES_PER_FRAME = 3
+
+        /**
+         * Extract a US-style plate token from cleaned uppercase OCR text.
+         *
+         * 1. Prefer a single space-delimited token of 5–8 chars containing >=1 digit and >=1 letter
+         *    (e.g. "CONNECTICUT LT2379 CONSTITUTION STATE" -> "LT2379").
+         * 2. Fallback for space/hyphen-split plates (e.g. "ABC 1234" or "123 ABC"): join adjacent
+         *    short tokens (each 2–4 chars) whose combined length is 5–8 with >=1 digit and >=1 letter.
+         */
+        internal fun extractPlateToken(cleanedUppercase: String): String? {
+            val tokens = cleanedUppercase.split(' ').filter { it.isNotEmpty() }
+            tokens.firstOrNull { token ->
+                token.length in 5..8 &&
+                    token.any { it.isDigit() } &&
+                    token.any { it.isLetter() }
+            }?.let { return it }
+
+            for (i in 0 until tokens.size - 1) {
+                val a = tokens[i]
+                val b = tokens[i + 1]
+                if (a.length in 2..4 && b.length in 2..4) {
+                    val combined = a + b
+                    if (combined.length in 5..8 &&
+                        combined.any { it.isDigit() } &&
+                        combined.any { it.isLetter() }
+                    ) {
+                        return combined
+                    }
+                }
+            }
+            return null
+        }
+
+        /**
+         * A17: loose US-plate plausibility, used only as a voting tiebreaker (never a hard filter).
+         * Returns 1 for plausible, 0 for digit-heavy OCR artifacts (e.g. "1234567X").
+         */
+        internal fun plateFormatScore(token: String): Int {
+            val letters = token.count { it.isLetter() }
+            val digits  = token.count { it.isDigit() }
+            if (letters == 1 && digits >= 6) return 0
+            return 1
+        }
+    }
+
+    internal data class VoteResult(
+        val primaryConsensus: String?,
+        val confirmedTokens: List<String>
+    )
+
+    internal class OcrVoteBuffer(
+        private val windowSize: Int = VOTE_WINDOW,
+        private val minVotes: Int = VOTE_MIN_COUNT
+    ) {
+        private val lock = Any()
+        private val recentFrameTokens = ArrayDeque<Set<String>>()
+
+        fun registerFrame(tokensInFrame: List<String>): VoteResult = synchronized(lock) {
+            val uniqueInFrame = tokensInFrame.toSet()
+            recentFrameTokens.addLast(uniqueInFrame)
+            while (recentFrameTokens.size > windowSize) recentFrameTokens.removeFirst()
+
+            val counts = mutableMapOf<String, Int>()
+            for (frameSet in recentFrameTokens) {
+                for (t in frameSet) {
+                    counts[t] = (counts[t] ?: 0) + 1
+                }
+            }
+
+            val confirmed = counts.entries
+                .filter { it.value >= minVotes }
+                .sortedWith(
+                    compareByDescending<Map.Entry<String, Int>> { it.value }
+                        .thenByDescending { if (it.key == tokensInFrame.firstOrNull()) 1 else 0 }
+                        .thenByDescending { plateFormatScore(it.key) }
+                )
+                .map { it.key }
+
+            VoteResult(
+                primaryConsensus = confirmed.firstOrNull(),
+                confirmedTokens = confirmed
+            )
+        }
+
+        fun reset() = synchronized(lock) { recentFrameTokens.clear() }
     }
 }

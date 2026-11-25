@@ -29,7 +29,9 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -54,7 +56,9 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.util.LruCache
 import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.DriverLog
@@ -63,7 +67,9 @@ import com.ct3d.jolt.ui.theme.Dimens
 import com.ct3d.jolt.ui.theme.JoltColors
 import com.ct3d.jolt.ui.theme.JoltTheme
 import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.osmdroid.config.Configuration
 import org.osmdroid.tileprovider.tilesource.TileSourceFactory
 import org.osmdroid.util.GeoPoint
@@ -122,11 +128,13 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // Configure OSMDroid tile cache directory
-        Configuration.getInstance().load(
-            applicationContext,
-            applicationContext.getSharedPreferences("osmdroid", Context.MODE_PRIVATE)
-        )
+        Configuration.getInstance().apply {
+            userAgentValue = applicationContext.packageName
+            load(
+                applicationContext,
+                applicationContext.getSharedPreferences("osmdroid", Context.MODE_PRIVATE)
+            )
+        }
 
         if (allPermissionsGranted()) setupServices()
         else permissionsLauncher.launch(requiredPermissions)
@@ -149,18 +157,22 @@ class MainActivity : ComponentActivity() {
         Log.i(TAG, "Initializing ALPR pipeline analyzer...")
         try {
             telephotoAnalyzer = TelephotoAnalyzer(applicationContext, lifecycleScope).also { analyzer ->
-                // A19: feed high-confidence detections to the training collector, but only while
-                // training mode is on (checked here so we don't have to swap the callback).
-                analyzer.trainingCallback = { frame, box ->
-                    if (viewModel.trainingModeEnabled.value) viewModel.onTrainingSample(frame, box)
+                analyzer.trainingCallback = { frame, boxes ->
+                    if (viewModel.trainingModeEnabled.value) viewModel.onTrainingSample(frame, boxes)
+                }
+                analyzer.frameTelemetryCallback = { frameTelemetry ->
+                    if (viewModel.telemetryEnabled.value) viewModel.onFrameTelemetry(frameTelemetry)
                 }
                 lifecycleScope.launch {
                     analyzer.pipelineState.collect { state ->
                         viewModel.updateActiveDetection(
-                            state.activePlateocr,
-                            state.activeVehicleMmc,
-                            state.plateBoxes,
-                            state.lastPlateCrop
+                            plateOcr        = state.activePlateocr,
+                            vehicleMmc      = state.activeVehicleMmc,
+                            plateBoxes      = state.plateBoxes,
+                            plateCrop       = state.lastPlateCrop,
+                            confirmedPlates = state.confirmedPlateTokens,
+                            frameWidth      = state.frameWidth,
+                            frameHeight     = state.frameHeight
                         )
                     }
                 }
@@ -197,12 +209,22 @@ fun JoltApp(
     val activeOcr          by viewModel.activePlateOcr.collectAsState()
     val activeMmc          by viewModel.activeVehicleMmc.collectAsState()
     val plateBoxes         by viewModel.plateBoxes.collectAsState()
+    val frameAspectRatio   by viewModel.frameAspectRatio.collectAsState()
     val logList            by viewModel.logsList.collectAsState()
     val gpsLocation        by viewModel.currentLocation.collectAsState()
     val bannerNotification by viewModel.notificationMessage.collectAsState()
     val badDriverAlert     by viewModel.knownBadDriverAlert.collectAsState()
     val trainingMode       by viewModel.trainingModeEnabled.collectAsState()
     val trainingCount      by viewModel.trainingSampleCount.collectAsState()
+    val telemetryEnabled   by viewModel.telemetryEnabled.collectAsState()
+    val telemetryCount     by viewModel.telemetryEventCount.collectAsState()
+
+    val selectTab: (Int, String) -> Unit = { idx, name ->
+        if (selectedTab != idx) {
+            selectedTab = idx
+            viewModel.onTabSelected(name)
+        }
+    }
 
     // Wrap everything in a Box so the alert border can float above the Scaffold
     Box(modifier = Modifier.fillMaxSize()) {
@@ -213,11 +235,11 @@ fun JoltApp(
                 tonalElevation = 0.dp,
                 modifier = Modifier.height(80.dp)
             ) {
-                JoltNavItem(0, selectedTab, { selectedTab = 0 }, Icons.Default.Videocam,      "Main")
-                JoltNavItem(1, selectedTab, { selectedTab = 1 }, Icons.Default.Map,           "Map")
-                JoltNavItem(2, selectedTab, { selectedTab = 2 }, Icons.Default.List,          "History")
-                JoltNavItem(3, selectedTab, { selectedTab = 3 }, Icons.Default.FileDownload,  "Export")
-                JoltNavItem(4, selectedTab, { selectedTab = 4 }, Icons.Default.ManageSearch,  "Manage")
+                JoltNavItem(0, selectedTab, { selectTab(0, "Main") },    Icons.Default.Videocam,      "Main")
+                JoltNavItem(1, selectedTab, { selectTab(1, "Map") },     Icons.Default.Map,           "Map")
+                JoltNavItem(2, selectedTab, { selectTab(2, "History") }, Icons.Default.List,          "History")
+                JoltNavItem(3, selectedTab, { selectTab(3, "Export") },  Icons.Default.FileDownload,  "Export")
+                JoltNavItem(4, selectedTab, { selectTab(4, "Manage") },  Icons.Default.ManageSearch,  "Manage")
             }
         }
     ) { paddingValues ->
@@ -232,6 +254,8 @@ fun JoltApp(
                     activeOcr          = activeOcr,
                     activeMmc          = activeMmc,
                     plateBoxes         = plateBoxes,
+                    frameAspectRatio   = frameAspectRatio,
+                    telemetryRecording = telemetryEnabled,
                     bannerNotification = bannerNotification,
                     onDismissNotification = viewModel::dismissNotification,
                     onFlagBadDriver    = viewModel::flagBadDriver,
@@ -243,12 +267,18 @@ fun JoltApp(
                 )
                 2 -> HistoryScreen(logList = logList)
                 3 -> ExportScreen(
-                    logList          = logList,
-                    trainingMode     = trainingMode,
-                    trainingCount    = trainingCount,
-                    onToggleTraining = viewModel::toggleTrainingMode,
-                    onExportTraining = viewModel::exportTrainingData,
-                    onBackupDatabase = viewModel::backupDatabase
+                    logList           = logList,
+                    trainingMode      = trainingMode,
+                    trainingCount     = trainingCount,
+                    onToggleTraining  = viewModel::toggleTrainingMode,
+                    onExportTraining  = viewModel::exportTrainingData,
+                    onClearTraining   = viewModel::clearTrainingData,
+                    telemetryEnabled  = telemetryEnabled,
+                    telemetryCount    = telemetryCount,
+                    onToggleTelemetry = viewModel::toggleTelemetryLogging,
+                    onExportTelemetry = viewModel::exportTelemetryReport,
+                    onClearTelemetry  = viewModel::clearTelemetryLogs,
+                    onBackupDatabase  = viewModel::backupDatabase
                 )
                 4 -> ManageScreen(
                     logList     = logList,
@@ -368,6 +398,8 @@ fun MainScreen(
     activeOcr: String?,
     activeMmc: String?,
     plateBoxes: List<PlateBox>,
+    frameAspectRatio: Float,
+    telemetryRecording: Boolean,
     bannerNotification: String?,
     onDismissNotification: () -> Unit,
     onFlagBadDriver: () -> Unit,
@@ -417,8 +449,9 @@ fun MainScreen(
 
             // Green bounding boxes drawn over detected plates
             BoundingBoxOverlay(
-                boxes    = plateBoxes,
-                modifier = Modifier.fillMaxSize()
+                boxes            = plateBoxes,
+                frameAspectRatio = frameAspectRatio,
+                modifier         = Modifier.fillMaxSize()
             )
 
             // Lens indicator chip (top-left)
@@ -436,6 +469,25 @@ fun MainScreen(
                     fontFamily = FontFamily.Monospace,
                     fontWeight = FontWeight.Bold
                 )
+            }
+
+            // Field Telemetry active indicator chip (top-right)
+            if (telemetryRecording) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .padding(8.dp)
+                        .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text       = "● REC TELEMETRY",
+                        color      = MaterialTheme.colorScheme.primary,
+                        fontSize   = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             // OCR / MMC result chip (bottom of camera view)
@@ -635,6 +687,8 @@ fun JoltMapView(
     // Holds the live MapView so the lifecycle observer below can actually pause/resume/detach it.
     // (Previously a local var that was never assigned, so onResume/onPause/onDetach were no-ops.)
     val mapViewHolder = remember { mutableStateOf<MapView?>(null) }
+    val lastRenderedLogs = remember { mutableStateOf<List<DriverLog>?>(null) }
+    val lastCenteredLoc  = remember { mutableStateOf<android.location.Location?>(null) }
 
     // Honour MapView pause/resume with the Activity lifecycle
     DisposableEffect(lifecycleOwner) {
@@ -657,6 +711,8 @@ fun JoltMapView(
         factory = { ctx ->
             MapView(ctx).also { mapView ->
                 mapView.setTileSource(TileSourceFactory.MAPNIK)
+                // App has no INTERNET permission (fully offline) — avoid failed HTTP tile requests.
+                mapView.setUseDataConnection(false)
                 mapView.setMultiTouchControls(true)
                 mapView.controller.setZoom(15.0)
                 mapView.controller.setCenter(GeoPoint(37.7749, -122.4194))
@@ -670,30 +726,31 @@ fun JoltMapView(
             }
         },
         update = { mapView ->
-            mapView.overlays.clear()
-
-            // Circle pins for every log — red for BAD flags, amber for SIGHTING re-encounters (R10).
-            // Tap a pin → OSMDroid shows the default info window with plate + time + battery
-            logs.forEach { log ->
-                val marker = Marker(mapView).apply {
-                    position = GeoPoint(log.latitude, log.longitude)
-                    title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
-                    snippet  = (if (log.rating == "SIGHTING") "SIGHTING  •  " else "") +
-                               dateFormat.format(Date(log.timestamp)) +
-                               "  •  Battery ${com.ct3d.jolt.service.BatteryMonitor.format(log.batteryLevel)}"
-                    icon     = if (log.rating == "SIGHTING") amberPinDrawable else redPinDrawable
-                    setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+            // Rebuild markers only when the DB logs list changes, not on every 5s GPS tick
+            // (which previously wiped overlays and closed open Marker info windows).
+            if (lastRenderedLogs.value !== logs) {
+                lastRenderedLogs.value = logs
+                mapView.overlays.clear()
+                logs.forEach { log ->
+                    val marker = Marker(mapView).apply {
+                        position = GeoPoint(log.latitude, log.longitude)
+                        title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
+                        snippet  = (if (log.rating == "SIGHTING") "SIGHTING  •  " else "") +
+                                   dateFormat.format(Date(log.timestamp)) +
+                                   "  •  Battery ${com.ct3d.jolt.service.BatteryMonitor.format(log.batteryLevel)}"
+                        icon     = if (log.rating == "SIGHTING") amberPinDrawable else redPinDrawable
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
+                    }
+                    mapView.overlays.add(marker)
                 }
-                mapView.overlays.add(marker)
+                mapView.invalidate()
             }
 
-            // Follow GPS until the user pans away
-            if (!userHasPanned) {
-                currentLocation?.let { loc ->
-                    mapView.controller.animateTo(GeoPoint(loc.latitude, loc.longitude))
-                }
+            // Follow GPS until the user pans away, only animating when location actually updates
+            if (!userHasPanned && currentLocation != null && currentLocation !== lastCenteredLoc.value) {
+                lastCenteredLoc.value = currentLocation
+                mapView.controller.animateTo(GeoPoint(currentLocation.latitude, currentLocation.longitude))
             }
-            mapView.invalidate()
         },
         modifier = modifier
     )
@@ -742,6 +799,12 @@ fun ExportScreen(
     trainingCount: Int,
     onToggleTraining: () -> Unit,
     onExportTraining: () -> Unit,
+    onClearTraining: () -> Unit,
+    telemetryEnabled: Boolean,
+    telemetryCount: Int,
+    onToggleTelemetry: () -> Unit,
+    onExportTelemetry: () -> Unit,
+    onClearTelemetry: () -> Unit,
     onBackupDatabase: () -> Unit
 ) {
     val context = LocalContext.current
@@ -749,6 +812,7 @@ fun ExportScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally
@@ -841,24 +905,134 @@ fun ExportScreen(
                     fontFamily = FontFamily.Monospace
                 )
                 Spacer(modifier = Modifier.height(Dimens.spaceSm))
-                Button(
-                    onClick  = onExportTraining,
-                    enabled  = trainingCount > 0,
-                    modifier = Modifier.fillMaxWidth().height(48.dp),
-                    colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
-                    shape    = RoundedCornerShape(10.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm)
                 ) {
-                    Icon(Icons.Default.FileDownload, contentDescription = null)
-                    Spacer(modifier = Modifier.width(Dimens.spaceSm))
-                    Text("Export Training ZIP", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    Button(
+                        onClick  = onExportTraining,
+                        enabled  = trainingCount > 0,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.FileDownload, contentDescription = null)
+                        Spacer(modifier = Modifier.width(Dimens.spaceSm))
+                        Text("Export ZIP", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                    OutlinedButton(
+                        onClick  = onClearTraining,
+                        enabled  = trainingCount > 0,
+                        modifier = Modifier.height(48.dp),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = "Clear training samples")
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(Dimens.spaceLg))
+
+        // Field Telemetry & Soak Logger card (Phase 5-7 drive validation without USB adb)
+        Card(
+            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape    = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(Dimens.spaceLg)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text       = "Field Telemetry Logger",
+                        fontWeight = FontWeight.SemiBold,
+                        color      = Color.White,
+                        fontSize   = 14.sp
+                    )
+                    Switch(checked = telemetryEnabled, onCheckedChange = { onToggleTelemetry() })
+                }
+                Spacer(modifier = Modifier.height(Dimens.spaceXs))
+                Text(
+                    text     = "Logs frame latency, thermal throttling/headroom, battery °C, " +
+                               "Java/native heap, GPS speed, OCR votes & MMC top-3 scores to disk.",
+                    color    = Color.Gray,
+                    fontSize = 11.sp
+                )
+                Spacer(modifier = Modifier.height(Dimens.spaceMd))
+                Text(
+                    text       = "$telemetryCount event${if (telemetryCount != 1) "s" else ""} logged",
+                    color      = if (telemetryEnabled) MaterialTheme.colorScheme.secondary else Color.Gray,
+                    fontSize   = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Spacer(modifier = Modifier.height(Dimens.spaceSm))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm)
+                ) {
+                    Button(
+                        onClick  = onExportTelemetry,
+                        enabled  = telemetryCount > 0,
+                        modifier = Modifier.weight(1f).height(48.dp),
+                        colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.FileDownload, contentDescription = null)
+                        Spacer(modifier = Modifier.width(Dimens.spaceSm))
+                        Text("Export Report (.txt)", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                    }
+                    OutlinedButton(
+                        onClick  = onClearTelemetry,
+                        enabled  = telemetryCount > 0,
+                        modifier = Modifier.height(48.dp),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Delete, contentDescription = "Clear telemetry logs")
+                    }
                 }
             }
         }
     }
 }
 
-/** Quote a CSV text field and escape embedded quotes (RFC 4180); empty string for null. */
-private fun csvField(value: String?): String {
+/** Bounded in-memory LRU cache for History plate thumbnails (bytes-sized, ~4 MB). */
+private object PlateThumbnailCache {
+    private val cache = object : LruCache<String, Bitmap>(4 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
+    }
+
+    fun get(path: String): Bitmap? = cache.get(path)?.takeIf { !it.isRecycled }
+    fun put(path: String, bmp: Bitmap) {
+        if (!bmp.isRecycled) cache.put(path, bmp)
+    }
+}
+
+private fun decodeSampledThumbnail(path: String, reqWidth: Int = 216, reqHeight: Int = 108): Bitmap? {
+    return try {
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, opts)
+        var inSampleSize = 1
+        val (h, w) = opts.outHeight to opts.outWidth
+        if (h > reqHeight || w > reqWidth) {
+            val halfH = h / 2
+            val halfW = w / 2
+            while (halfH / inSampleSize >= reqHeight && halfW / inSampleSize >= reqWidth) {
+                inSampleSize *= 2
+            }
+        }
+        BitmapFactory.Options().apply { this.inSampleSize = inSampleSize }.let {
+            BitmapFactory.decodeFile(path, it)
+        }
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/** Format a CSV text field per RFC 4180; empty string for null. */
+internal fun csvField(value: String?): String {
     val v = value ?: return ""
     return "\"" + v.replace("\"", "\"\"") + "\""
 }
@@ -1043,9 +1217,19 @@ fun DriverLogItemWidget(log: DriverLog) {
     val formattedDate = remember(log.timestamp) {
         SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(log.timestamp))
     }
-    val cropBitmap = remember(log.plateCropPath) {
-        log.plateCropPath?.let { path ->
-            try { BitmapFactory.decodeFile(path) } catch (e: Exception) { null }
+    val cropBitmap by produceState<Bitmap?>(initialValue = log.plateCropPath?.let { PlateThumbnailCache.get(it) }, log.plateCropPath) {
+        val path = log.plateCropPath
+        if (path == null) {
+            value = null
+            return@produceState
+        }
+        val cached = PlateThumbnailCache.get(path)
+        if (cached != null) {
+            value = cached
+            return@produceState
+        }
+        value = withContext(Dispatchers.IO) {
+            decodeSampledThumbnail(path)?.also { PlateThumbnailCache.put(path, it) }
         }
     }
     Card(
@@ -1090,9 +1274,10 @@ fun DriverLogItemWidget(log: DriverLog) {
                     fontFamily = FontFamily.Monospace
                 )
             }
-            if (cropBitmap != null) {
+            val thumb = cropBitmap
+            if (thumb != null) {
                 androidx.compose.foundation.Image(
-                    bitmap             = cropBitmap.asImageBitmap(),
+                    bitmap             = thumb.asImageBitmap(),
                     contentDescription = "Plate crop",
                     modifier           = Modifier
                         .size(width = 72.dp, height = 36.dp)
@@ -1110,14 +1295,35 @@ fun DriverLogItemWidget(log: DriverLog) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun BoundingBoxOverlay(boxes: List<PlateBox>, modifier: Modifier = Modifier) {
+fun BoundingBoxOverlay(
+    boxes: List<PlateBox>,
+    frameAspectRatio: Float = 0.75f,
+    modifier: Modifier = Modifier
+) {
     val green = JoltColors.bboxGreen
     Canvas(modifier = modifier) {
+        if (boxes.isEmpty() || size.width <= 0f || size.height <= 0f) return@Canvas
+        // Match PreviewView's default FILL_CENTER (aspect-fill + center-crop) projection so
+        // green boxes align with the rendered preview instead of stretching across aspect ratios.
+        val canvasAspect = size.width / size.height
+        val safeFrameAspect = if (frameAspectRatio > 0f) frameAspectRatio else canvasAspect
+        val renderW: Float
+        val renderH: Float
+        if (safeFrameAspect > canvasAspect) {
+            renderH = size.height
+            renderW = size.height * safeFrameAspect
+        } else {
+            renderW = size.width
+            renderH = size.width / safeFrameAspect
+        }
+        val offsetX = (size.width - renderW) / 2f
+        val offsetY = (size.height - renderH) / 2f
+
         boxes.forEach { box ->
-            val l = box.left   * size.width
-            val t = box.top    * size.height
-            val r = box.right  * size.width
-            val b = box.bottom * size.height
+            val l = offsetX + box.left   * renderW
+            val t = offsetY + box.top    * renderH
+            val r = offsetX + box.right  * renderW
+            val b = offsetY + box.bottom * renderH
             drawRect(
                 color    = green,
                 topLeft  = Offset(l, t),
@@ -1140,13 +1346,6 @@ fun CameraPreviewWidget(
     analyzer: TelephotoAnalyzer?
 ) {
     val context = LocalContext.current
-
-    // Backstop cleanup: the sensor listener is enabled/disabled on view attach/detach below, but
-    // also disable it when this composable leaves composition so the sensor never stays live.
-    val orientationListenerRef = remember { mutableStateOf<android.view.OrientationEventListener?>(null) }
-    DisposableEffect(Unit) {
-        onDispose { orientationListenerRef.value?.disable() }
-    }
 
     // R12: the ImageAnalysis use case is built here rather than inside the AndroidView factory.
     // The factory lambda runs exactly ONCE per view instance, so anything captured in it (like the
@@ -1187,30 +1386,11 @@ fun CameraPreviewWidget(
                         setSurfaceProvider(previewView.surfaceProvider)
                     }
 
-                    // Auto-rotate CameraX with device orientation
-                    val orientationEventListener = object : android.view.OrientationEventListener(ctx) {
-                        override fun onOrientationChanged(orientation: Int) {
-                            if (orientation == ORIENTATION_UNKNOWN) return
-                            val rotation = when (orientation) {
-                                in 45 until 135  -> android.view.Surface.ROTATION_270
-                                in 135 until 225 -> android.view.Surface.ROTATION_180
-                                in 225 until 315 -> android.view.Surface.ROTATION_90
-                                else             -> android.view.Surface.ROTATION_0
-                            }
-                            try {
-                                preview.targetRotation       = rotation
-                                imageAnalysis.targetRotation = rotation
-                            } catch (e: Exception) {
-                                Log.w("CameraPreviewWidget", "Rotation update failed: ${e.localizedMessage}")
-                            }
-                        }
-                    }
-
-                    orientationListenerRef.value = orientationEventListener
-                    previewView.addOnAttachStateChangeListener(object : android.view.View.OnAttachStateChangeListener {
-                        override fun onViewAttachedToWindow(v: android.view.View)  { orientationEventListener.enable() }
-                        override fun onViewDetachedFromWindow(v: android.view.View) { orientationEventListener.disable() }
-                    })
+                    // MainActivity is locked to portrait in AndroidManifest.xml; keep Preview and
+                    // ImageAnalysis locked to Surface.ROTATION_0 so slight mount tilt never rotates
+                    // frames sideways for YOLO/OCR.
+                    preview.targetRotation = android.view.Surface.ROTATION_0
+                    imageAnalysis.targetRotation = android.view.Surface.ROTATION_0
 
                     val telephotoSelector = findTelephotoCameraSelector(cameraProvider)
                     try {

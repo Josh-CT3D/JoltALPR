@@ -32,38 +32,74 @@ import java.util.zip.ZipOutputStream
  */
 class TrainingDataCollector(private val context: Context) {
 
-    /**
-     * Called by TelephotoAnalyzer when a plate is detected in Training Mode.
-     * @param frameBitmap  Full camera frame (A6: no ROI crop) as a Bitmap.
-     * @param plateBox     Bounding box of the detected plate within frameBitmap coordinates.
-     */
-    fun onPlateDetected(frameBitmap: Bitmap, plateBox: RectF) {
-        val timestamp = System.currentTimeMillis()
-        val dir = File(context.filesDir, "training_data/$timestamp").also { it.mkdirs() }
+    @Volatile
+    private var lastSavedAtMs: Long = 0L
 
-        try {
-            // Save JPEG frame
-            val jpegFile = File(dir, "$timestamp.jpg")
+    @Volatile
+    private var lastSavedBox: RectF? = null
+
+    /**
+     * Called by TelephotoAnalyzer when confident plates are detected in Training Mode.
+     * Writes ALL confident boxes in the frame to the YOLO label file so secondary plates aren't
+     * taught as false negatives, and throttles near-duplicate static frames (e.g. stopped at lights).
+     *
+     * @return true if a new sample was written, false if skipped by deduplication or error.
+     */
+    fun onPlateDetected(frameBitmap: Bitmap, plateBoxes: List<RectF>): Boolean {
+        if (plateBoxes.isEmpty()) return false
+
+        val now = System.currentTimeMillis()
+        val primaryBox = plateBoxes.first()
+        val prevBox = lastSavedBox
+        val elapsed = now - lastSavedAtMs
+        if (elapsed < MIN_SAMPLE_INTERVAL_MS) return false
+        if (elapsed < DEDUP_WINDOW_MS && prevBox != null && calculateIoU(prevBox, primaryBox) > DEDUP_IOU_THRESHOLD) {
+            return false
+        }
+
+        val dir = File(context.filesDir, "training_data/$now").also { it.mkdirs() }
+
+        return try {
+            val jpegFile = File(dir, "$now.jpg")
             FileOutputStream(jpegFile).use { out ->
                 frameBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
             }
 
-            // Save YOLO annotation (class 0 = license_plate, normalized coords)
             val fw = frameBitmap.width.toFloat()
             val fh = frameBitmap.height.toFloat()
-            val xCenter = ((plateBox.left + plateBox.right)  / 2f) / fw
-            val yCenter = ((plateBox.top  + plateBox.bottom) / 2f) / fh
-            val width   = (plateBox.right  - plateBox.left) / fw
-            val height  = (plateBox.bottom - plateBox.top)  / fh
+            val yoloLines = plateBoxes.joinToString("\n") { box ->
+                val xCenter = (((box.left + box.right) / 2f) / fw).coerceIn(0f, 1f)
+                val yCenter = (((box.top + box.bottom) / 2f) / fh).coerceIn(0f, 1f)
+                val width   = ((box.right - box.left) / fw).coerceIn(0f, 1f)
+                val height  = ((box.bottom - box.top) / fh).coerceIn(0f, 1f)
+                "0 $xCenter $yCenter $width $height"
+            } + "\n"
 
-            val labelFile = File(dir, "$timestamp.txt")
-            labelFile.writeText("0 $xCenter $yCenter $width $height\n")
+            val labelFile = File(dir, "$now.txt")
+            labelFile.writeText(yoloLines)
 
-            Log.i(TAG, "Training sample saved: $timestamp (box: $plateBox)")
-
+            lastSavedAtMs = now
+            lastSavedBox = RectF(primaryBox)
+            Log.i(TAG, "Training sample saved: $now (${plateBoxes.size} boxes)")
+            true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to save training sample: ${e.localizedMessage}", e)
+            dir.deleteRecursively()
+            false
         }
+    }
+
+    private fun calculateIoU(a: RectF, b: RectF): Float {
+        val l = maxOf(a.left, b.left)
+        val t = maxOf(a.top, b.top)
+        val r = minOf(a.right, b.right)
+        val bt = minOf(a.bottom, b.bottom)
+        if (r <= l || bt <= t) return 0f
+        val inter = (r - l) * (bt - t)
+        val areaA = (a.right - a.left) * (a.bottom - a.top)
+        val areaB = (b.right - b.left) * (b.bottom - b.top)
+        val union = areaA + areaB - inter
+        return if (union > 0f) inter / union else 0f
     }
 
     /** Returns the total number of collected training samples. */
@@ -137,5 +173,8 @@ class TrainingDataCollector(private val context: Context) {
 
     companion object {
         private const val TAG = "TrainingDataCollector"
+        private const val MIN_SAMPLE_INTERVAL_MS = 1_500L
+        private const val DEDUP_WINDOW_MS = 4_000L
+        private const val DEDUP_IOU_THRESHOLD = 0.85f
     }
 }

@@ -34,9 +34,21 @@ class YoloV8Detector(private val context: Context) {
         val confidence: Float
     )
 
+    internal data class ParsedBox(
+        val left: Float,
+        val top: Float,
+        val right: Float,
+        val bottom: Float,
+        val confidence: Float
+    )
+
     private var interpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
     private val labels = listOf("license_plate")
+
+    @Volatile
+    var isUsingGpuDelegate: Boolean = false
+        private set
 
     // Model input size (YOLOv8 typically uses 640x640)
     private val inputSize = 640
@@ -92,12 +104,14 @@ class YoloV8Detector(private val context: Context) {
             gpuDelegate = delegate
             val gpuOptions = Interpreter.Options().apply { addDelegate(delegate) }
             val gpuInterpreter = Interpreter(modelBuffer, gpuOptions)
+            isUsingGpuDelegate = true
             Log.i(TAG, "GPU delegate enabled")
             return gpuInterpreter
         } catch (e: Exception) {
             Log.w(TAG, "GPU delegate unavailable, CPU fallback: ${e.message}")
             gpuDelegate?.close()
             gpuDelegate = null
+            isUsingGpuDelegate = false
         }
 
         val cpuOptions = Interpreter.Options().apply { setNumThreads(4) }
@@ -179,119 +193,19 @@ class YoloV8Detector(private val context: Context) {
         }
     }
 
-    /**
-     * Parse YOLOv8 transposed output [5][8400] into Detection objects.
-     * output[0][i] = cx, [1][i] = cy, [2][i] = w, [3][i] = h, [4][i] = score (single class).
-     * Coordinates are in model input space (0–640); scale back to original image dimensions.
-     */
     private fun parseOutput(
         output: Array<FloatArray>,  // shape [5][8400]
         originalWidth: Int,
         originalHeight: Int,
         confidenceThreshold: Float
-    ): List<Detection> {
-        val detections = mutableListOf<Detection>()
-        val numAnchors = output[0].size
+    ): List<Detection> = parseOutputBoxes(output, originalWidth, originalHeight, confidenceThreshold)
+        .map { Detection(RectF(it.left, it.top, it.right, it.bottom), labels[0], it.confidence) }
 
-        val scaleX = originalWidth.toFloat() / inputSize
-        val scaleY = originalHeight.toFloat() / inputSize
-
-        // Check whether coordinates are normalized (0–1) or in pixel space (0–640).
-        // Roboflow TFLite models export normalized coords; standard Ultralytics exports use pixel space.
-        // We sample the first high-confidence detection to determine which format this model uses.
-        var formatLogged = false
-
-        for (i in 0 until numAnchors) {
-            val score = output[4][i]
-            if (score < confidenceThreshold) continue
-
-            val cx = output[0][i]
-            val cy = output[1][i]
-            val w  = output[2][i]
-            val h  = output[3][i]
-
-            if (!formatLogged) {
-                Log.i(TAG, "First detection raw values: cx=$cx cy=$cy w=$w h=$h score=$score " +
-                           "(if cx/cy/w/h are all <2.0, model outputs normalized 0–1 coords)")
-                formatLogged = true
-            }
-
-            // If coordinates look normalized (max value < 2.0), scale by image dimensions directly.
-            // Otherwise assume 0–640 pixel space and use scaleX/scaleY.
-            val isNormalized = cx < 2.0f && cy < 2.0f && w < 2.0f && h < 2.0f
-            val left: Float
-            val top: Float
-            val right: Float
-            val bottom: Float
-            if (isNormalized) {
-                left   = (cx - w / 2f) * originalWidth
-                top    = (cy - h / 2f) * originalHeight
-                right  = (cx + w / 2f) * originalWidth
-                bottom = (cy + h / 2f) * originalHeight
-            } else {
-                left   = (cx - w / 2f) * scaleX
-                top    = (cy - h / 2f) * scaleY
-                right  = (cx + w / 2f) * scaleX
-                bottom = (cy + h / 2f) * scaleY
-            }
-
-            val box = RectF(
-                left.coerceIn(0f, originalWidth.toFloat()),
-                top.coerceIn(0f, originalHeight.toFloat()),
-                right.coerceIn(0f, originalWidth.toFloat()),
-                bottom.coerceIn(0f, originalHeight.toFloat())
-            )
-
-            detections.add(Detection(box, labels[0], score))
-        }
-
-        return detections
-    }
-
-    /**
-     * Apply Non-Maximum Suppression (NMS) to remove overlapping detections.
-     * Keeps only the detection with highest confidence when boxes overlap significantly.
-     */
     private fun applyNMS(detections: List<Detection>, iouThreshold: Float): List<Detection> {
         if (detections.isEmpty()) return emptyList()
-
-        // Sort by confidence (highest first)
-        val sortedDetections = detections.sortedByDescending { it.confidence }.toMutableList()
-        val keepDetections = mutableListOf<Detection>()
-
-        while (sortedDetections.isNotEmpty()) {
-            val best = sortedDetections.removeAt(0)
-            keepDetections.add(best)
-
-            // Remove overlapping detections of the same class
-            sortedDetections.removeAll { detection ->
-                detection.label == best.label &&
-                calculateIoU(best.box, detection.box) > iouThreshold
-            }
-        }
-
-        return keepDetections
-    }
-
-    /**
-     * Calculate Intersection over Union (IoU) between two bounding boxes.
-     */
-    private fun calculateIoU(box1: RectF, box2: RectF): Float {
-        val intersectLeft = max(box1.left, box2.left)
-        val intersectTop = max(box1.top, box2.top)
-        val intersectRight = min(box1.right, box2.right)
-        val intersectBottom = min(box1.bottom, box2.bottom)
-
-        if (intersectRight <= intersectLeft || intersectBottom <= intersectTop) {
-            return 0f // No intersection
-        }
-
-        val intersectArea = (intersectRight - intersectLeft) * (intersectBottom - intersectTop)
-        val box1Area = (box1.right - box1.left) * (box1.bottom - box1.top)
-        val box2Area = (box2.right - box2.left) * (box2.bottom - box2.top)
-        val unionArea = box1Area + box2Area - intersectArea
-
-        return intersectArea / unionArea
+        val raw = detections.map { ParsedBox(it.box.left, it.box.top, it.box.right, it.box.bottom, it.confidence) }
+        return applyNmsBoxes(raw, iouThreshold)
+            .map { Detection(RectF(it.left, it.top, it.right, it.bottom), labels[0], it.confidence) }
     }
 
     /**
@@ -317,6 +231,7 @@ class YoloV8Detector(private val context: Context) {
         interpreter = null
         gpuDelegate?.close()
         gpuDelegate = null
+        isUsingGpuDelegate = false
         if (::resizedBitmap.isInitialized && !resizedBitmap.isRecycled) {
             resizedBitmap.recycle()
         }
@@ -325,5 +240,83 @@ class YoloV8Detector(private val context: Context) {
 
     companion object {
         private const val TAG = "YoloV8Detector"
+        private const val MODEL_INPUT_SIZE = 640
+
+        internal fun parseOutputBoxes(
+            output: Array<FloatArray>,
+            originalWidth: Int,
+            originalHeight: Int,
+            confidenceThreshold: Float,
+            inputSize: Int = MODEL_INPUT_SIZE
+        ): List<ParsedBox> {
+            val detections = mutableListOf<ParsedBox>()
+            val numAnchors = output[0].size
+            val scaleX = originalWidth.toFloat() / inputSize
+            val scaleY = originalHeight.toFloat() / inputSize
+
+            for (i in 0 until numAnchors) {
+                val score = output[4][i]
+                if (score < confidenceThreshold) continue
+
+                val cx = output[0][i]
+                val cy = output[1][i]
+                val w  = output[2][i]
+                val h  = output[3][i]
+
+                // Auto-detect normalized (0-1) vs pixel-space (0-640) coords.
+                val isNormalized = cx < 2.0f && cy < 2.0f && w < 2.0f && h < 2.0f
+                val left: Float
+                val top: Float
+                val right: Float
+                val bottom: Float
+                if (isNormalized) {
+                    left   = (cx - w / 2f) * originalWidth
+                    top    = (cy - h / 2f) * originalHeight
+                    right  = (cx + w / 2f) * originalWidth
+                    bottom = (cy + h / 2f) * originalHeight
+                } else {
+                    left   = (cx - w / 2f) * scaleX
+                    top    = (cy - h / 2f) * scaleY
+                    right  = (cx + w / 2f) * scaleX
+                    bottom = (cy + h / 2f) * scaleY
+                }
+
+                detections.add(
+                    ParsedBox(
+                        left = left.coerceIn(0f, originalWidth.toFloat()),
+                        top = top.coerceIn(0f, originalHeight.toFloat()),
+                        right = right.coerceIn(0f, originalWidth.toFloat()),
+                        bottom = bottom.coerceIn(0f, originalHeight.toFloat()),
+                        confidence = score
+                    )
+                )
+            }
+            return detections
+        }
+
+        internal fun applyNmsBoxes(boxes: List<ParsedBox>, iouThreshold: Float): List<ParsedBox> {
+            if (boxes.isEmpty()) return emptyList()
+            val sorted = boxes.sortedByDescending { it.confidence }.toMutableList()
+            val keep = mutableListOf<ParsedBox>()
+            while (sorted.isNotEmpty()) {
+                val best = sorted.removeAt(0)
+                keep.add(best)
+                sorted.removeAll { box -> calculateIoU(best, box) > iouThreshold }
+            }
+            return keep
+        }
+
+        private fun calculateIoU(b1: ParsedBox, b2: ParsedBox): Float {
+            val l = max(b1.left, b2.left)
+            val t = max(b1.top, b2.top)
+            val r = min(b1.right, b2.right)
+            val b = min(b1.bottom, b2.bottom)
+            if (r <= l || b <= t) return 0f
+            val inter = (r - l) * (b - t)
+            val a1 = (b1.right - b1.left) * (b1.bottom - b1.top)
+            val a2 = (b2.right - b2.left) * (b2.bottom - b2.top)
+            val union = a1 + a2 - inter
+            return if (union > 0f) inter / union else 0f
+        }
     }
 }

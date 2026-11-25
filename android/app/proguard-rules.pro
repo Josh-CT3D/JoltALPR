@@ -15,3 +15,10 @@
 # OSMDroid tile providers & reflection
 -keep class org.osmdroid.** { *; }
 -dontwarn org.osmdroid.**
+
+# Vosk & JNA native bindings for offline speech recognition
+-keep class com.sun.jna.** { *; }
+-keep class * implements com.sun.jna.** { *; }
+-keep class org.vosk.** { *; }
+-dontwarn com.sun.jna.**
+-dontwarn org.vosk.**

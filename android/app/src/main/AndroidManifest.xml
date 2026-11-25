@@ -2,11 +2,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Offline Vosk wake-phrase & hands-free voice command recognition -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Haptic feedback on FLAG press and known-bad-driver alert (A21) -->
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <!-- OSMDroid: needed for map tile network state checks (works offline too) -->
+    <!-- OSMDroid: street map background tile downloading & local caching -->
+    <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- OSMDroid: tile cache on external storage (API 28 and below only; scoped storage handles 29+) -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"

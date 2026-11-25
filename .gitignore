@@ -13,9 +13,10 @@ android/.cxx/
 .gradle/
 build/
 
-# TFLite model files — large binaries, distribute separately
+# TFLite & Vosk offline model files — large binaries, distribute separately
 # Comment these out if you want models in the repo
 android/app/src/main/assets/*.tflite
+android/app/src/main/assets/model-en-us/
 
 # App signing keys — never commit
 *.jks

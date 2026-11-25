@@ -26,6 +26,8 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -61,7 +63,11 @@ import android.graphics.BitmapFactory
 import android.util.LruCache
 import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.camera.TelephotoAnalyzer
+import com.ct3d.jolt.data.BehaviorTag
 import com.ct3d.jolt.data.DriverLog
+import com.ct3d.jolt.data.JoltSeverity
+import com.ct3d.jolt.data.VehicleReputation
+import com.ct3d.jolt.speech.VoskVoiceController
 import com.ct3d.jolt.ui.DashcamViewModel
 import com.ct3d.jolt.ui.theme.Dimens
 import com.ct3d.jolt.ui.theme.JoltColors
@@ -106,7 +112,8 @@ class MainActivity : ComponentActivity() {
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
         Manifest.permission.ACCESS_FINE_LOCATION,
-        Manifest.permission.ACCESS_COARSE_LOCATION
+        Manifest.permission.ACCESS_COARSE_LOCATION,
+        Manifest.permission.RECORD_AUDIO
     )
 
     private val permissionsLauncher = registerForActivityResult(
@@ -116,6 +123,7 @@ class MainActivity : ComponentActivity() {
         val locationOk = permissions[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
         if (cameraOk && locationOk) {
             setupServices()
+            viewModel.initializeVoiceIfPermitted()
         } else {
             Toast.makeText(this, "Camera and GPS permissions are required.", Toast.LENGTH_LONG).show()
         }
@@ -136,8 +144,14 @@ class MainActivity : ComponentActivity() {
             )
         }
 
-        if (allPermissionsGranted()) setupServices()
-        else permissionsLauncher.launch(requiredPermissions)
+        if (corePermissionsGranted()) {
+            setupServices()
+            if (!allPermissionsGranted()) {
+                permissionsLauncher.launch(requiredPermissions)
+            }
+        } else {
+            permissionsLauncher.launch(requiredPermissions)
+        }
 
         setContent {
             JoltTheme {
@@ -149,11 +163,19 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun corePermissionsGranted() = listOf(
+        Manifest.permission.CAMERA,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    ).all {
+        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
     private fun allPermissionsGranted() = requiredPermissions.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun setupServices() {
+        if (telephotoAnalyzer != null) return
         Log.i(TAG, "Initializing ALPR pipeline analyzer...")
         try {
             telephotoAnalyzer = TelephotoAnalyzer(applicationContext, lifecycleScope).also { analyzer ->
@@ -214,6 +236,8 @@ fun JoltApp(
     val gpsLocation        by viewModel.currentLocation.collectAsState()
     val bannerNotification by viewModel.notificationMessage.collectAsState()
     val badDriverAlert     by viewModel.knownBadDriverAlert.collectAsState()
+    val voiceState         by viewModel.voiceState.collectAsState()
+    val recentFlagState    by viewModel.recentFlagState.collectAsState()
     val trainingMode       by viewModel.trainingModeEnabled.collectAsState()
     val trainingCount      by viewModel.trainingSampleCount.collectAsState()
     val telemetryEnabled   by viewModel.telemetryEnabled.collectAsState()
@@ -251,15 +275,21 @@ fun JoltApp(
         ) {
             when (selectedTab) {
                 0 -> MainScreen(
-                    activeOcr          = activeOcr,
-                    activeMmc          = activeMmc,
-                    plateBoxes         = plateBoxes,
-                    frameAspectRatio   = frameAspectRatio,
-                    telemetryRecording = telemetryEnabled,
-                    bannerNotification = bannerNotification,
+                    activeOcr             = activeOcr,
+                    activeMmc             = activeMmc,
+                    plateBoxes            = plateBoxes,
+                    frameAspectRatio      = frameAspectRatio,
+                    voiceState            = voiceState,
+                    onToggleVoiceMute     = viewModel::toggleVoiceMute,
+                    recentFlagState       = recentFlagState,
+                    onToggleQuickTag      = viewModel::toggleQuickTagOnRecentFlag,
+                    onUndoRecentFlag      = { viewModel.undoLastAction(fromVoice = false) },
+                    telemetryRecording    = telemetryEnabled,
+                    bannerNotification    = bannerNotification,
                     onDismissNotification = viewModel::dismissNotification,
-                    onFlagBadDriver    = viewModel::flagBadDriver,
-                    getAnalyzer        = getAnalyzer
+                    onFlagBadDriver       = { viewModel.flagBadDriver() },
+                    onFlagAngel           = { viewModel.flagAngelDriver() },
+                    getAnalyzer           = getAnalyzer
                 )
                 1 -> JoltMapScreen(
                     logs            = logList,
@@ -289,27 +319,43 @@ fun JoltApp(
         }
     } // end Scaffold
 
-    // Known Bad Driver Alert — yellow pulsing border overlaid above everything
-    if (badDriverAlert != null) {
-        PulsingAlertBorder(
-            plate     = badDriverAlert!!.plateOcr ?: "Unknown",
-            onDismiss = viewModel::dismissAlert
+    // Phase 2 Tactical Encounter HUD — severity-coded pulsing border + pips + Angel status
+    val activeAlert = badDriverAlert
+    if (activeAlert != null) {
+        TacticalEncounterHud(
+            reputation = activeAlert,
+            onDismiss  = viewModel::dismissAlert
         )
     }
 
     } // end outer Box
 }
 
+@Composable
+private fun severityUiColor(severity: JoltSeverity): Color = when (severity) {
+    JoltSeverity.MAROON -> JoltColors.severityMaroon
+    JoltSeverity.RED    -> JoltColors.severityRed
+    JoltSeverity.ORANGE -> JoltColors.severityOrange
+    JoltSeverity.YELLOW -> JoltColors.severityYellow
+    JoltSeverity.ANGEL  -> JoltColors.angelGreen
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Known Bad Driver Alert — yellow pulsing screen border
+// Phase 2 Tactical Encounter HUD (Bounty-Hunter style severity + pips + certainty)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun PulsingAlertBorder(plate: String, onDismiss: () -> Unit) {
+fun TacticalEncounterHud(reputation: VehicleReputation, onDismiss: () -> Unit) {
     // Auto-dismiss after 15 seconds
-    LaunchedEffect(plate) {
+    LaunchedEffect(reputation.plateNormalized, reputation.latestIncidentTimestamp) {
         kotlinx.coroutines.delay(15_000L)
         onDismiss()
+    }
+
+    val hudColor = severityUiColor(reputation.effectiveSeverity)
+    val onHudTextColor = when (reputation.effectiveSeverity) {
+        JoltSeverity.MAROON, JoltSeverity.RED -> Color.White
+        else -> Color.Black
     }
 
     val infiniteTransition = rememberInfiniteTransition(label = "alert_pulse")
@@ -324,42 +370,63 @@ fun PulsingAlertBorder(plate: String, onDismiss: () -> Unit) {
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Full-perimeter yellow pulsing border
+        // Full-perimeter severity-colored pulsing border
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .border(Dimens.alertBorder, JoltColors.alertYellow.copy(alpha = borderAlpha))
+                .border(Dimens.alertBorder, hudColor.copy(alpha = borderAlpha))
         )
 
-        // Warning card at top-center
+        // Compact Tactical HUD card at top-center
         Card(
-            shape    = RoundedCornerShape(8.dp),
-            colors   = CardDefaults.cardColors(containerColor = JoltColors.alertYellow),
+            shape    = RoundedCornerShape(10.dp),
+            colors   = CardDefaults.cardColors(containerColor = hudColor),
             modifier = Modifier
                 .align(Alignment.TopCenter)
-                .padding(top = 6.dp)
+                .padding(top = 8.dp, start = 12.dp, end = 12.dp)
         ) {
             Row(
-                modifier          = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                modifier          = Modifier.padding(horizontal = 14.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    imageVector        = Icons.Default.Warning,
+                    imageVector = if (reputation.isPureAngel) Icons.Default.Star else Icons.Default.Warning,
                     contentDescription = null,
-                    tint               = Color.Black,
-                    modifier           = Modifier.size(20.dp)
+                    tint = onHudTextColor,
+                    modifier = Modifier.size(22.dp)
                 )
                 Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                    text       = "⚠  CAUTION — KNOWN BAD DRIVER  |  PLATE: $plate",
-                    color      = Color.Black,
-                    fontWeight = FontWeight.ExtraBold,
-                    fontSize   = 14.sp,
-                    fontFamily = FontFamily.Monospace
-                )
-                Spacer(modifier = Modifier.width(10.dp))
-                IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
-                    Icon(Icons.Default.Close, contentDescription = "Dismiss", tint = Color.Black)
+                Column(modifier = Modifier.weight(1f, fill = false)) {
+                    // Primary tactical line: SEVERITY • BEHAVIOR • INCIDENT PIPS
+                    val pips = if (reputation.badIncidentCount > 0) {
+                        val dots = "●".repeat(reputation.badIncidentCount.coerceAtMost(5))
+                        val extra = if (reputation.badIncidentCount > 5) "+${reputation.badIncidentCount - 5}" else ""
+                        "  $dots$extra"
+                    } else ""
+                    val halo = if (reputation.hasAngelHalo && !reputation.isPureAngel) "  ★ ANGEL" else ""
+                    Text(
+                        text       = "${reputation.effectiveSeverity.displayLabel} • ${reputation.primaryHudBehavior}$pips$halo",
+                        color      = onHudTextColor,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize   = 13.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    val certaintyLabel = if (reputation.matchConfidence >= 0.95f) {
+                        "CONFIRMED PLATE: ${reputation.plateDisplay}"
+                    } else {
+                        "${(reputation.matchConfidence * 100).toInt()}% SUSPECTED: ${reputation.plateDisplay}"
+                    }
+                    Text(
+                        text       = "$certaintyLabel  •  ${reputation.effectiveSeverity.defensiveAction}",
+                        color      = onHudTextColor.copy(alpha = 0.88f),
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize   = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(onClick = onDismiss, modifier = Modifier.size(26.dp)) {
+                    Icon(Icons.Default.Close, contentDescription = "Dismiss", tint = onHudTextColor)
                 }
             }
         }
@@ -399,10 +466,16 @@ fun MainScreen(
     activeMmc: String?,
     plateBoxes: List<PlateBox>,
     frameAspectRatio: Float,
+    voiceState: VoskVoiceController.State,
+    onToggleVoiceMute: () -> Unit,
+    recentFlagState: DashcamViewModel.RecentFlagState?,
+    onToggleQuickTag: (BehaviorTag) -> Unit,
+    onUndoRecentFlag: () -> Unit,
     telemetryRecording: Boolean,
     bannerNotification: String?,
     onDismissNotification: () -> Unit,
     onFlagBadDriver: () -> Unit,
+    onFlagAngel: () -> Unit,
     getAnalyzer: () -> TelephotoAnalyzer?
 ) {
     val context        = LocalContext.current
@@ -454,21 +527,53 @@ fun MainScreen(
                 modifier         = Modifier.fillMaxSize()
             )
 
-            // Lens indicator chip (top-left)
-            Box(
+            // Lens + Hands-Free Voice indicator chips (top-left)
+            Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
-                    .padding(8.dp)
-                    .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text       = "5× TELEPHOTO",
-                    color      = MaterialTheme.colorScheme.secondary,
-                    fontSize   = 10.sp,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold
-                )
+                Box(
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.65f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text       = "5× TELEPHOTO",
+                        color      = MaterialTheme.colorScheme.secondary,
+                        fontSize   = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                val (voiceLabel, voiceColor) = when (voiceState) {
+                    VoskVoiceController.State.LISTENING       -> "🎙 SAY \"JOLT…\"" to MaterialTheme.colorScheme.secondary
+                    VoskVoiceController.State.AWAITING_REASON -> "🎙 REASON?" to JoltColors.alertYellow
+                    VoskVoiceController.State.MUTED_BY_USER   -> "🔇 MIC MUTED" to Color.Gray
+                    VoskVoiceController.State.INITIALIZING    -> "🎙 VOICE INIT…" to MaterialTheme.colorScheme.tertiary
+                    VoskVoiceController.State.UNAVAILABLE     -> "🔇 VOICE OFF" to Color.Gray
+                }
+                Box(
+                    modifier = Modifier
+                        .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(4.dp))
+                        .clickable(
+                            enabled = voiceState != VoskVoiceController.State.UNAVAILABLE &&
+                                voiceState != VoskVoiceController.State.INITIALIZING,
+                            onClick = onToggleVoiceMute
+                        )
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    Text(
+                        text       = voiceLabel,
+                        color      = voiceColor,
+                        fontSize   = 10.sp,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
             }
 
             // Field Telemetry active indicator chip (top-right)
@@ -537,31 +642,98 @@ fun MainScreen(
             }
         }
 
-        // ── FLAG BAD DRIVER button — fills ~22% of remaining height ──
-        Button(
-            onClick  = onFlagBadDriver,
+        // Optional 7-second quick-tag chip bar after flagging (attach up to 2 behavior tags or Undo)
+        AnimatedVisibility(visible = recentFlagState != null) {
+            val rf = recentFlagState
+            if (rf != null) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surface)
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = 12.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onUndoRecentFlag,
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        Text("UNDO", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = JoltColors.alertYellow)
+                    }
+                    BehaviorTag.entries.forEach { tag ->
+                        val selected = tag in rf.selectedTags
+                        FilterChip(
+                            selected = selected,
+                            onClick  = { onToggleQuickTag(tag) },
+                            label    = {
+                                Text(
+                                    text       = tag.shortHudCode,
+                                    fontSize   = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                            }
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── Bottom Action Row: FLAG BAD DRIVER + ANGEL (fallback for voice) ──
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
-                .padding(horizontal = 16.dp, vertical = 10.dp),
-            colors    = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-            shape     = RoundedCornerShape(14.dp),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 8.dp)
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Icon(
-                imageVector        = Icons.Default.Flag,
-                contentDescription = null,
-                tint               = Color.White,
-                modifier           = Modifier.size(28.dp)
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Text(
-                text          = "FLAG BAD DRIVER",
-                color         = Color.White,
-                fontSize      = 20.sp,
-                fontWeight    = FontWeight.ExtraBold,
-                letterSpacing = 2.sp
-            )
+            Button(
+                onClick   = onFlagBadDriver,
+                modifier  = Modifier.weight(2.8f).fillMaxHeight(),
+                colors    = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+                shape     = RoundedCornerShape(14.dp),
+                elevation = ButtonDefaults.buttonElevation(defaultElevation = 8.dp)
+            ) {
+                Icon(
+                    imageVector        = Icons.Default.Flag,
+                    contentDescription = null,
+                    tint               = Color.White,
+                    modifier           = Modifier.size(26.dp)
+                )
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text          = "FLAG BAD",
+                    color         = Color.White,
+                    fontSize      = 19.sp,
+                    fontWeight    = FontWeight.ExtraBold,
+                    letterSpacing = 1.5.sp
+                )
+            }
+
+            Button(
+                onClick   = onFlagAngel,
+                modifier  = Modifier.weight(1.2f).fillMaxHeight(),
+                colors    = ButtonDefaults.buttonColors(containerColor = JoltColors.angelGreen),
+                shape     = RoundedCornerShape(14.dp),
+                elevation = ButtonDefaults.buttonElevation(defaultElevation = 6.dp)
+            ) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(
+                        imageVector        = Icons.Default.Star,
+                        contentDescription = "Angel courteous vehicle",
+                        tint               = Color.Black,
+                        modifier           = Modifier.size(22.dp)
+                    )
+                    Text(
+                        text       = "ANGEL",
+                        color      = Color.Black,
+                        fontSize   = 12.sp,
+                        fontWeight = FontWeight.ExtraBold
+                    )
+                }
+            }
         }
     }
 }
@@ -681,11 +853,13 @@ fun JoltMapView(
         cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp * 2.5f, paint)
         android.graphics.drawable.BitmapDrawable(context.resources, bmp)
     }
-    val redPinDrawable   = remember(context) { makePin("#FF1744") } // BAD flag
-    val amberPinDrawable = remember(context) { makePin("#FFD700") } // SIGHTING re-encounter
+    val maroonPinDrawable = remember(context) { makePin("#AD1457") } // MAROON persistent threat
+    val redPinDrawable    = remember(context) { makePin("#FF1744") } // RED flag
+    val orangePinDrawable = remember(context) { makePin("#FF9100") } // ORANGE flag
+    val yellowPinDrawable = remember(context) { makePin("#FFD700") } // YELLOW / SIGHTING
+    val greenPinDrawable  = remember(context) { makePin("#00E676") } // ANGEL goodwill mark
 
     // Holds the live MapView so the lifecycle observer below can actually pause/resume/detach it.
-    // (Previously a local var that was never assigned, so onResume/onPause/onDetach were no-ops.)
     val mapViewHolder = remember { mutableStateOf<MapView?>(null) }
     val lastRenderedLogs = remember { mutableStateOf<List<DriverLog>?>(null) }
     val lastCenteredLoc  = remember { mutableStateOf<android.location.Location?>(null) }
@@ -711,11 +885,11 @@ fun JoltMapView(
         factory = { ctx ->
             MapView(ctx).also { mapView ->
                 mapView.setTileSource(TileSourceFactory.MAPNIK)
-                // App has no INTERNET permission (fully offline) — avoid failed HTTP tile requests.
-                mapView.setUseDataConnection(false)
+                // Internet enabled for automatic street-map tile downloading & local tile caching.
+                mapView.setUseDataConnection(true)
                 mapView.setMultiTouchControls(true)
                 mapView.controller.setZoom(15.0)
-                mapView.controller.setCenter(GeoPoint(37.7749, -122.4194))
+                mapView.controller.setCenter(GeoPoint(41.7658, -72.6734)) // Central CT default
                 mapView.setOnTouchListener { v, _ ->
                     onUserPanned()
                     v.performClick()
@@ -726,19 +900,31 @@ fun JoltMapView(
             }
         },
         update = { mapView ->
-            // Rebuild markers only when the DB logs list changes, not on every 5s GPS tick
-            // (which previously wiped overlays and closed open Marker info windows).
             if (lastRenderedLogs.value !== logs) {
                 lastRenderedLogs.value = logs
                 mapView.overlays.clear()
                 logs.forEach { log ->
+                    val tagsLabel = BehaviorTag.parseList(log.behaviorTags)
+                        .joinToString(", ") { it.displayLabel }
+                    val markerPin = when {
+                        log.rating == "ANGEL"    -> greenPinDrawable
+                        log.rating == "SIGHTING" -> yellowPinDrawable
+                        else -> when (JoltSeverity.fromCode(log.severity)) {
+                            JoltSeverity.MAROON -> maroonPinDrawable
+                            JoltSeverity.RED    -> redPinDrawable
+                            JoltSeverity.YELLOW -> yellowPinDrawable
+                            else                -> orangePinDrawable
+                        }
+                    }
                     val marker = Marker(mapView).apply {
                         position = GeoPoint(log.latitude, log.longitude)
                         title    = log.plateOcr ?: log.vehicleMmc ?: "Flagged Vehicle"
-                        snippet  = (if (log.rating == "SIGHTING") "SIGHTING  •  " else "") +
-                                   dateFormat.format(Date(log.timestamp)) +
-                                   "  •  Battery ${com.ct3d.jolt.service.BatteryMonitor.format(log.batteryLevel)}"
-                        icon     = if (log.rating == "SIGHTING") amberPinDrawable else redPinDrawable
+                        snippet  = listOfNotNull(
+                            log.severity ?: log.rating,
+                            tagsLabel.ifEmpty { null },
+                            dateFormat.format(Date(log.timestamp))
+                        ).joinToString("  •  ")
+                        icon     = markerPin
                         setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_CENTER)
                     }
                     mapView.overlays.add(marker)
@@ -1050,7 +1236,7 @@ private fun exportToCsv(context: Context, logs: List<DriverLog>) {
             context.contentResolver.openOutputStream(it)?.use { stream ->
                 stream.write(
                     ("ID,Timestamp,Latitude,Longitude,PlateOCR,PlateNormalized,VehicleMMC," +
-                        "Rating,Battery,PlateCropPath\n").toByteArray()
+                        "Rating,Severity,BehaviorTags,MatchConfidence,Notes,Battery,PlateCropPath\n").toByteArray()
                 )
                 logs.forEach { log ->
                     val line = listOf(
@@ -1062,6 +1248,10 @@ private fun exportToCsv(context: Context, logs: List<DriverLog>) {
                         csvField(log.plateNormalized),
                         csvField(log.vehicleMmc),
                         log.rating,
+                        csvField(log.severity),
+                        csvField(log.behaviorTags),
+                        log.matchConfidence.toString(),
+                        csvField(log.notes),
                         log.batteryLevel.toString(),
                         csvField(log.plateCropPath)
                     ).joinToString(",") + "\n"
@@ -1209,13 +1399,23 @@ fun EmptyState(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
 
 @Composable
 fun DriverLogItemWidget(log: DriverLog) {
-    val ratingColor = when (log.rating) {
-        "BAD"      -> MaterialTheme.colorScheme.primary
-        "SIGHTING" -> JoltColors.alertYellow
-        else       -> MaterialTheme.colorScheme.secondary
+    val parsedSeverity = JoltSeverity.fromCode(log.severity)
+    val ratingColor = when {
+        log.rating == "ANGEL"    -> JoltColors.angelGreen
+        log.rating == "SIGHTING" -> JoltColors.alertYellow
+        parsedSeverity != null   -> severityUiColor(parsedSeverity)
+        else                     -> MaterialTheme.colorScheme.primary
+    }
+    val badgeText = when (log.rating) {
+        "ANGEL"    -> "★ ANGEL"
+        "SIGHTING" -> "SEEN"
+        else       -> parsedSeverity?.displayLabel ?: log.rating
+    }
+    val tagsSummary = remember(log.behaviorTags) {
+        BehaviorTag.parseList(log.behaviorTags).joinToString(" • ") { it.shortHudCode }
     }
     val formattedDate = remember(log.timestamp) {
-        SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(log.timestamp))
+        SimpleDateFormat("MM/dd HH:mm", Locale.getDefault()).format(Date(log.timestamp))
     }
     val cropBitmap by produceState<Bitmap?>(initialValue = log.plateCropPath?.let { PlateThumbnailCache.get(it) }, log.plateCropPath) {
         val path = log.plateCropPath
@@ -1238,19 +1438,19 @@ fun DriverLogItemWidget(log: DriverLog) {
         modifier = Modifier.fillMaxWidth()
     ) {
         Row(
-            modifier          = Modifier.padding(12.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
+            modifier              = Modifier.padding(12.dp).fillMaxWidth(),
+            verticalAlignment     = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             Text(
-                text       = log.rating,
+                text       = badgeText,
                 color      = ratingColor,
                 fontWeight = FontWeight.Bold,
-                fontSize   = 11.sp,
+                fontSize   = 10.sp,
                 fontFamily = FontFamily.Monospace,
-                modifier   = Modifier.width(36.dp)
+                modifier   = Modifier.width(56.dp)
             )
-            Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
                 if (log.plateOcr != null) {
                     Text(
                         text       = "Plate: ${log.plateOcr}",
@@ -1261,16 +1461,31 @@ fun DriverLogItemWidget(log: DriverLog) {
                     )
                 } else {
                     Text(
-                        text       = log.vehicleMmc ?: "Unidentified",
+                        text       = log.vehicleMmc ?: log.notes ?: "Unidentified",
                         color      = MaterialTheme.colorScheme.tertiary,
                         fontWeight = FontWeight.SemiBold,
                         fontSize   = 12.sp
                     )
                 }
+                if (tagsSummary.isNotEmpty()) {
+                    Text(
+                        text       = tagsSummary,
+                        color      = ratingColor,
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize   = 10.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+                val metaLine = buildString {
+                    if (log.plateOcr != null && !log.vehicleMmc.isNullOrBlank()) {
+                        append(log.vehicleMmc).append("  •  ")
+                    }
+                    append(formattedDate)
+                }
                 Text(
-                    text     = "GPS: [${String.format("%.4f", log.latitude)}, ${String.format("%.4f", log.longitude)}]",
-                    color    = Color.Gray,
-                    fontSize = 9.sp,
+                    text       = metaLine,
+                    color      = Color.Gray,
+                    fontSize   = 9.sp,
                     fontFamily = FontFamily.Monospace
                 )
             }

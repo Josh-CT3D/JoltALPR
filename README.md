@@ -38,8 +38,9 @@ database. Every subsequent plate read is checked against that database in real t
 | Plate detection | Custom YOLOv8n (see Models below) |
 | OCR | Google ML Kit Text Recognition V2 (bundled, offline) |
 | Vehicle fallback | Custom EfficientNet-B0 (see Models below) |
-| Database | Room (SQLite), explicit versioned migrations |
-| Maps | OSMDroid, offline tiles |
+| Voice control | Vosk Android (`vosk-model-small-en-us`, offline constrained grammar) + Android TTS |
+| Database | Room (SQLite) v6, explicit versioned migrations (`MIGRATION_4_5`, `MIGRATION_5_6`) |
+| Maps | OSMDroid (online tile download + local offline tile cache) |
 
 ## Building
 
@@ -53,12 +54,21 @@ cd android
 ./gradlew assembleDebug
 ```
 
-**Note on model files:** `mmc_classifier.tflite` (the vehicle-fallback model, ~17 MB) is
-gitignored and not in this repo — it needs to be copied into
-`android/app/src/main/assets/` separately. The app degrades gracefully without it: plate
-detection and OCR work normally, the vehicle-fallback feature is simply disabled.
-`yolov8_license_plate.tflite` (the plate detector) is also gitignored for the same reason
-(large binary, distributed separately).
+**Note on model files:** The large offline ML & speech binaries are gitignored and live locally in `android/app/src/main/assets/`:
+- `yolov8_license_plate.tflite` — custom YOLOv8n plate detector (~12 MB)
+- `mmc_classifier.tflite` — EfficientNet-B0 196-class vehicle fallback (~17 MB)
+- `model-en-us/` — unpacked `vosk-model-small-en-us-0.15` directory (with `uuid` file) for offline `"Jolt..."` wake-phrase & command recognition
+
+The app degrades gracefully if optional models (`mmc_classifier.tflite` or `model-en-us/`) are absent on a fresh clone.
+
+## Hands-Free Voice Commands & Tactical HUD
+
+Say **"Jolt"** (or **"Hey Jolt"**) while on the **Main** tab:
+- **One-shot flagging:** `"Jolt, flag weaving"`, `"Jolt, flag white SUV cutting and asshole"`, `"Jolt, flag tailgating"`
+- **Two-step conversational flagging:** `"Jolt, flag that car"` → Jolt reads the plate aloud (`"Plate L T 2 3 7 9. Reason?"`) → reply within 7 seconds (`"Line cutter"`, `"Unsteady throttle"`, `"No plate"`, etc.)
+- **Positive Angel mark:** `"Jolt, angel that car"` (permanent green goodwill badge alongside any history)
+- **Corrections & mute:** `"Jolt, wrong car"` / `"Jolt, cancel"` (undoes the last flag or suppresses an active alert), `"Jolt, mute alerts"` / `"Jolt, unmute alerts"`
+- **Repeat-encounter Tactical HUD:** Displays severity color (**Maroon / Red / Orange / Yellow / Angel Green**), behavior code, incident count pips (`● ●`), Angel halo (`★ ANGEL`), match certainty, and concise spoken TTS alerts (*"Red. Weaver."*).
 
 ## Models
 

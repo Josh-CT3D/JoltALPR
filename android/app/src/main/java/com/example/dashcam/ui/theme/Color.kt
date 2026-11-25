@@ -19,9 +19,14 @@ val JoltSurface    = Color(0xFF1E1E1E) // cards & elevated surfaces
 
 /** Semantic colors that don't map onto a standard Material color role. */
 object JoltColors {
-    val alertYellow  = Color(0xFFFFD700) // known-bad-driver pulsing border + warning card
-    val bboxGreen    = JoltGreen         // plate bounding-box stroke
-    val actionBlue   = Color(0xFF1565C0) // secondary action buttons (re-center FAB, export CSV)
-    val navBar       = Color(0xFF111111) // bottom navigation container
-    val navIndicator = Color(0xFF2A0A0F) // selected nav item pill (deep red)
+    val alertYellow    = Color(0xFFFFD700) // yellow severity / sighting pin
+    val severityMaroon = Color(0xFFAD1457) // maroon — persistent/extreme threat pattern
+    val severityRed    = JoltRed           // red — immediate road risk
+    val severityOrange = Color(0xFFFF9100) // orange — meaningful caution
+    val severityYellow = alertYellow       // yellow — nuisance / behavioral tell
+    val angelGreen     = JoltGreen         // green — Angel courteous/goodwill mark
+    val bboxGreen      = JoltGreen         // plate bounding-box stroke
+    val actionBlue     = Color(0xFF1565C0) // secondary action buttons (re-center FAB, export CSV)
+    val navBar         = Color(0xFF111111) // bottom navigation container
+    val navIndicator   = Color(0xFF2A0A0F) // selected nav item pill (deep red)
 }

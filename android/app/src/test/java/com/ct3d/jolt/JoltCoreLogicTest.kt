@@ -1,10 +1,18 @@
 package com.ct3d.jolt
 
 import com.ct3d.jolt.camera.TelephotoAnalyzer
+import com.ct3d.jolt.data.BehaviorTag
+import com.ct3d.jolt.data.DriverLog
+import com.ct3d.jolt.data.JoltSeverity
+import com.ct3d.jolt.data.computeVehicleReputation
 import com.ct3d.jolt.data.normalizePlate
 import com.ct3d.jolt.ml.YoloV8Detector
 import com.ct3d.jolt.service.FieldTelemetryLogger
+import com.ct3d.jolt.speech.VoiceCommand
+import com.ct3d.jolt.speech.VoiceCommandParser
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -136,5 +144,74 @@ class JoltCoreLogicTest {
         assertTrue(summary.contains("Native heap MB:  start=88.0  end=91.5  peak=91.5  (delta=+3.5 MB)"))
         assertTrue(summary.contains("MMC triggered:   5 frames (anchored=5, center=0)  |  Published (>=0.25): 5"))
         assertTrue(summary.contains("PASS — p95=145ms (<290ms), thermal<=LIGHT, native heap stable."))
+    }
+
+    @Test
+    fun voiceCommandParser_handlesWakeWordTagsAngelFollowUpAndCorrections() {
+        // Ignore speech without wake word in normal mode
+        assertNull(VoiceCommandParser.parse("weaving and speeding", awaitingFollowUpReason = false))
+        assertNull(VoiceCommandParser.parse("[unk]", awaitingFollowUpReason = true))
+
+        // One-shot wake command with descriptors + 2 behavior tags
+        val cmd1 = VoiceCommandParser.parse(
+            "hey jolt flag white honda suv cutting and asshole",
+            awaitingFollowUpReason = false
+        ) as? VoiceCommand.FlagVehicle
+        assertNotNull(cmd1)
+        assertEquals(listOf(BehaviorTag.CUTTING, BehaviorTag.ASSHOLE), cmd1!!.tags)
+        assertEquals("white honda suv", cmd1.descriptorNotes)
+        // "white" should not override severity; default severity of CUTTING/ASSHOLE is RED
+        assertNull(cmd1.severityOverride)
+        assertEquals(JoltSeverity.RED, BehaviorTag.defaultSeverityFor(cmd1.tags, cmd1.severityOverride))
+
+        // Follow-up reason without wake word when awaiting reason
+        val followUp = VoiceCommandParser.parse(
+            "unsteady throttle and weaving",
+            awaitingFollowUpReason = true
+        ) as? VoiceCommand.FollowUpReason
+        assertNotNull(followUp)
+        assertEquals(listOf(BehaviorTag.THROTTLE, BehaviorTag.WEAVING), followUp!!.tags)
+
+        // Angel command
+        val angel = VoiceCommandParser.parse("jolt angel that silver sedan", awaitingFollowUpReason = false)
+        assertTrue(angel is VoiceCommand.AngelVehicle)
+        assertEquals("silver sedan", (angel as VoiceCommand.AngelVehicle).descriptorNotes)
+
+        // Wrong car / cancel
+        assertEquals(VoiceCommand.UndoOrWrongCar, VoiceCommandParser.parse("jolt wrong car", awaitingFollowUpReason = false))
+        assertEquals(VoiceCommand.UndoOrWrongCar, VoiceCommandParser.parse("cancel", awaitingFollowUpReason = true))
+        assertEquals(VoiceCommand.MuteAlerts, VoiceCommandParser.parse("jolt mute alerts", awaitingFollowUpReason = false))
+    }
+
+    @Test
+    fun vehicleReputation_escalatesRepeatRedToMaroonAndPreservesAngelHalo() {
+        val logs = listOf(
+            DriverLog(
+                id = 1, rating = "BAD", plateOcr = "LT2379", plateNormalized = "LT2379",
+                vehicleMmc = "Honda CR-V SUV 2012", timestamp = 1_000L, latitude = 41.7, longitude = -72.6,
+                behaviorTags = "CUTTING", severity = "RED"
+            ),
+            DriverLog(
+                id = 2, rating = "ANGEL", plateOcr = "LT2379", plateNormalized = "LT2379",
+                vehicleMmc = "Honda CR-V SUV 2012", timestamp = 2_000L, latitude = 41.7, longitude = -72.6,
+                severity = "ANGEL"
+            ),
+            DriverLog(
+                id = 3, rating = "BAD", plateOcr = "LT2379", plateNormalized = "LT2379",
+                vehicleMmc = "Honda CR-V SUV 2012", timestamp = 3_000L, latitude = 41.7, longitude = -72.6,
+                behaviorTags = "CUTTING,TAILGATING", severity = "RED"
+            )
+        )
+
+        val rep = computeVehicleReputation(logs)
+        assertNotNull(rep)
+        // 2 RED incidents escalate to MAROON automatically (Requirements §6)
+        assertEquals(JoltSeverity.MAROON, rep!!.effectiveSeverity)
+        assertEquals(2, rep.badIncidentCount)
+        assertEquals(1, rep.angelCount)
+        assertTrue(rep.hasAngelHalo)
+        assertFalse(rep.isPureAngel)
+        assertEquals("LINE CUTTER + TAILGATER", rep.primaryHudBehavior)
+        assertEquals("Maroon. Repeat line cutter. 2 prior flags. Also marked angel.", rep.buildSpokenAlert())
     }
 }

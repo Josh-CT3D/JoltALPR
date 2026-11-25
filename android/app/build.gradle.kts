@@ -90,8 +90,12 @@ dependencies {
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
 
-    // OSMDroid — offline map tiles, no API key required
+    // OSMDroid — map tiles (online caching + offline support), no API key required
     implementation("org.osmdroid:osmdroid-android:6.1.18")
+
+    // Vosk — 100% offline constrained-grammar wake-phrase & voice command recognition
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47")
 
     // WorkManager — background training data ZIP export (Phase 6)
     implementation("androidx.work:work-runtime-ktx:2.9.0")

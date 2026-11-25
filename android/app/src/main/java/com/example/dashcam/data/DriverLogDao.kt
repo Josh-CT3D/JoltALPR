@@ -31,6 +31,22 @@ interface DriverLogDao {
     @Query("SELECT * FROM driver_logs WHERE plateNormalized = :normalizedPlate AND rating = 'BAD' ORDER BY timestamp DESC LIMIT 1")
     suspend fun findBadDriverByPlate(normalizedPlate: String): DriverLog?
 
+    /**
+     * Phase 2 Vehicle Reputation lookup: fetches all BAD, ANGEL, and SIGHTING rows for a
+     * normalized plate so [computeVehicleReputation] can compute cumulative severity, incident
+     * pips, and parallel Angel goodwill status.
+     */
+    @Query("SELECT * FROM driver_logs WHERE plateNormalized = :normalizedPlate ORDER BY timestamp DESC")
+    suspend fun findVehicleHistoryByPlate(normalizedPlate: String): List<DriverLog>
+
+    /** Updates behavior tags and severity on an existing incident (e.g. follow-up voice reason or quick-tag chip). */
+    @Query("UPDATE driver_logs SET behaviorTags = :behaviorTags, severity = :severity WHERE id = :id")
+    suspend fun updateLogTagsAndSeverity(id: Long, behaviorTags: String?, severity: String?)
+
+    /** Fetches the most recent user-created incident ("BAD" or "ANGEL") for voice "wrong car" / "undo". */
+    @Query("SELECT * FROM driver_logs WHERE rating IN ('BAD', 'ANGEL') ORDER BY timestamp DESC LIMIT 1")
+    suspend fun getLatestUserFlag(): DriverLog?
+
     // --- Continuous GPS Breadcrumbs Location History ---
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLocationRecordInternal(record: LocationRecord): Long

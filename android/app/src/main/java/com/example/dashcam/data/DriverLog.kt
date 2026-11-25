@@ -19,15 +19,19 @@ import androidx.room.PrimaryKey
 data class DriverLog(
     @PrimaryKey(autoGenerate = true)
     val id: Long = 0,
-    val rating: String, // "GOOD" or "BAD"
+    val rating: String, // "BAD", "ANGEL", or "SIGHTING"
     val plateOcr: String?, // Raw resolved plate string, shown in the UI verbatim
-    val plateNormalized: String? = null, // OCR-confusion-folded form used for known-bad matching (A16)
-    val vehicleMmc: String?, // Make, Model, Color if plate was not found
+    val plateNormalized: String? = null, // OCR-confusion-folded form used for matching (A16)
+    val vehicleMmc: String?, // Make/Model class (retained alongside plateOcr in v6+)
     val timestamp: Long, // Epoch millis
     val latitude: Double, // Device GPS coordinates
     val longitude: Double,
     val batteryLevel: Int = 100, // System battery level percentage (default 100)
-    val plateCropPath: String? = null // Absolute path to JPEG crop saved in filesDir/crops/
+    val plateCropPath: String? = null, // Absolute path to JPEG crop saved in filesDir/crops/
+    val behaviorTags: String? = null, // Up to 2 comma-separated BehaviorTag names (e.g. "CUTTING,ASSHOLE")
+    val severity: String? = null, // "YELLOW", "ORANGE", "RED", "MAROON", or "ANGEL"
+    val matchConfidence: Float = 1.0f, // 1.0 = confirmed plate, <1.0 = partial/suspected match
+    val notes: String? = null // Optional voice descriptor (e.g. "white suv")
 )
 
 /**

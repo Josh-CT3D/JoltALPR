@@ -221,6 +221,10 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         }
 
         when (command) {
+            VoiceCommand.WakeDetected -> {
+                feedback.wakeWordAcknowledged()
+                _notificationMessage.value = "🎙 Listening — say \"flag\", \"weaving\", \"cutting\", \"angel\", or \"cancel\"…"
+            }
             is VoiceCommand.FlagVehicle -> {
                 flagBadDriver(
                     tags = command.tags,

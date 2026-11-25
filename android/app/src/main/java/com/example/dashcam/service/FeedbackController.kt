@@ -38,7 +38,8 @@ class FeedbackController(context: Context) {
             ?.defaultVibrator
 
     private val toneGenerator: ToneGenerator? = try {
-        ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
+        // Use STREAM_MUSIC so chimes are audible even when the Pixel ringer switch is on Vibrate.
+        ToneGenerator(AudioManager.STREAM_MUSIC, 90)
     } catch (e: Exception) {
         Log.w(TAG, "ToneGenerator unavailable: ${e.message}")
         null
@@ -55,7 +56,7 @@ class FeedbackController(context: Context) {
                     engine.setSpeechRate(1.08f) // Crisp, tactical cadence
                     engine.setAudioAttributes(
                         AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
                             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                             .build()
                     )
@@ -102,6 +103,12 @@ class FeedbackController(context: Context) {
     fun flagPressed() {
         vibrateOneShot(60L)
         playTone(ToneGenerator.TONE_PROP_ACK, 130)
+    }
+
+    /** Crisp wake acknowledgment tick + high chime when user says "Jolt" and pauses for command. */
+    fun wakeWordAcknowledged() {
+        vibrateOneShot(40L)
+        playTone(ToneGenerator.TONE_PROP_BEEP, 110)
     }
 
     /** Legacy fallback alert cue. */

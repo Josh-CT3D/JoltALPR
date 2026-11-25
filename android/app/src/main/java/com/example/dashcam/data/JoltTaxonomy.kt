@@ -57,7 +57,7 @@ enum class BehaviorTag(
         shortHudCode = "TAILGATER",
         spokenPhrase = "tailgater",
         defaultSeverity = JoltSeverity.RED,
-        voicePhrases = listOf("tailgating", "tailgater", "riding")
+        voicePhrases = listOf("tailgating", "riding", "following close")
     ),
     SPEED(
         displayLabel = "Speed",
@@ -71,7 +71,7 @@ enum class BehaviorTag(
         shortHudCode = "NO LANE",
         spokenPhrase = "no lane control",
         defaultSeverity = JoltSeverity.ORANGE,
-        voicePhrases = listOf("no lane", "cant hold lane", "no blinker", "rubbernecking", "lane blocker")
+        voicePhrases = listOf("no lane", "wandering", "no blinker", "rubbernecking", "lane blocker")
     ),
     NO_PLATE(
         displayLabel = "No / Obscured Plate",

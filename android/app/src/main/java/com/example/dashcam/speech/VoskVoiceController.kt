@@ -18,6 +18,9 @@ import org.vosk.android.StorageService
  * Structured hands-free voice commands recognized by Jolt's offline constrained-grammar spotter.
  */
 sealed interface VoiceCommand {
+    /** User spoke the wake word ("Jolt" / "Hey Jolt") and paused — opens an 8s active command window. */
+    data object WakeDetected : VoiceCommand
+
     data class FlagVehicle(
         val tags: List<BehaviorTag>,
         val severityOverride: JoltSeverity?,
@@ -40,14 +43,16 @@ sealed interface VoiceCommand {
  * Pure, deterministic parser for constrained-grammar Vosk transcripts.
  *
  * Supports:
- *  - One-shot wake commands: "jolt flag white suv weaving and speed", "hey jolt angel that car"
- *  - Two-turn follow-up window (when [awaitingFollowUpReason] = true): driver can just say
- *    "line cutter" or "tailgating" without repeating the wake word "jolt".
- *  - Corrections & controls: "jolt wrong car", "jolt cancel", "jolt mute alerts".
+ *  - Standalone wake word ("Jolt" / "Hey Jolt") -> [VoiceCommand.WakeDetected] (opens 8s command window)
+ *  - One-shot wake commands ("Jolt flag weaving", "Hey Jolt angel that car")
+ *  - Active awake window ([isAwakeForCommand] = true): after saying "Jolt", any action word ("flag",
+ *    "weaving", "cutting", "angel", "cancel", etc.) executes immediately without repeating "Jolt"!
+ *  - Post-flag follow-up window ([awaitingFollowUpReason] = true): refines the just-created flag.
  */
 object VoiceCommandParser {
 
-    private val wakeWords = listOf("jolt", "hey jolt", "okay jolt")
+    // Phonetic aliases ("bolt", "volt") catch noisy-cabin consonant shifts on "jolt".
+    private val wakeTokens = setOf("jolt", "bolt", "volt")
 
     private val descriptorVocabulary = listOf(
         "white", "black", "silver", "gray", "red", "blue", "green",
@@ -57,14 +62,13 @@ object VoiceCommandParser {
 
     fun buildGrammarJson(): String {
         val phrases = linkedSetOf<String>()
-        // Wake & command starters
         phrases.addAll(
             listOf(
-                "jolt", "hey jolt", "okay jolt",
-                "flag", "mark", "angel",
+                "jolt", "hey jolt", "okay jolt", "hey bolt", "hey volt",
+                "flag", "flag that", "flag car", "mark", "angel", "angel car",
                 "that", "the", "car", "vehicle", "ahead", "in front", "on left", "on right", "for", "and",
-                "wrong car", "cancel", "undo", "remove last report",
-                "mute alerts", "unmute alerts",
+                "wrong car", "cancel", "undo", "delete", "remove", "remove last",
+                "mute", "mute alerts", "sound on", "alerts on",
                 "yellow", "orange", "red", "maroon"
             )
         )
@@ -72,7 +76,6 @@ object VoiceCommandParser {
         for (tag in BehaviorTag.entries) {
             phrases.addAll(tag.voicePhrases)
         }
-        // Escape hatch for non-command cabin speech / road noise
         phrases.add("[unk]")
         return JSONArray(phrases.toList()).toString()
     }
@@ -87,7 +90,19 @@ object VoiceCommandParser {
         }
     }
 
-    fun parse(rawTranscript: String, awaitingFollowUpReason: Boolean): VoiceCommand? {
+    fun containsWakeToken(rawTranscript: String): Boolean {
+        val tokens = rawTranscript.lowercase()
+            .replace(Regex("[^a-z ]"), " ")
+            .split(' ')
+            .filter { it.isNotEmpty() }
+        return tokens.any { it in wakeTokens }
+    }
+
+    fun parse(
+        rawTranscript: String,
+        awaitingFollowUpReason: Boolean,
+        isAwakeForCommand: Boolean = false
+    ): VoiceCommand? {
         val cleaned = rawTranscript
             .lowercase()
             .replace("[unk]", " ")
@@ -97,29 +112,35 @@ object VoiceCommandParser {
         if (cleaned.isEmpty()) return null
 
         val tokens = cleaned.split(' ')
-        val hasWakeWord = tokens.contains("jolt")
+        val hasWakeWord = tokens.any { it in wakeTokens }
+        val activeContext = hasWakeWord || isAwakeForCommand || awaitingFollowUpReason
 
-        // Global undo/cancel works both with wake word AND bare inside the 6s follow-up window
-        if (hasWakeWord || awaitingFollowUpReason) {
-            if (cleaned.contains("wrong car") ||
+        // Global undo/cancel works whenever awake, in follow-up, or prefixed with wake word
+        if (activeContext) {
+            if (cleaned.contains("wrong") ||
                 tokens.contains("cancel") ||
                 tokens.contains("undo") ||
-                cleaned.contains("remove last")
+                tokens.contains("delete") ||
+                cleaned.contains("remove")
             ) {
                 return VoiceCommand.UndoOrWrongCar
             }
         }
 
-        if (hasWakeWord) {
-            if (cleaned.contains("unmute")) return VoiceCommand.UnmuteAlerts
-            if (cleaned.contains("mute")) return VoiceCommand.MuteAlerts
+        if (hasWakeWord || isAwakeForCommand) {
+            if (cleaned.contains("alerts on") || cleaned.contains("sound on")) {
+                return VoiceCommand.UnmuteAlerts
+            }
+            if (tokens.contains("mute")) {
+                return VoiceCommand.MuteAlerts
+            }
         }
 
         val matchedTags = extractBehaviorTags(cleaned)
         val severityOverride = extractSeverityOverride(tokens, cleaned)
         val descriptorNotes = extractDescriptors(tokens)
 
-        // Follow-up window: no wake word required if the user supplies behavior tag(s) or severity
+        // Post-flag follow-up window: attach spoken reason to the flag that was just saved
         if (!hasWakeWord && awaitingFollowUpReason) {
             if (matchedTags.isNotEmpty() || severityOverride != null) {
                 return VoiceCommand.FollowUpReason(
@@ -127,12 +148,15 @@ object VoiceCommandParser {
                     severityOverride = severityOverride
                 )
             }
+            if (tokens.contains("angel")) {
+                return VoiceCommand.AngelVehicle(descriptorNotes = descriptorNotes)
+            }
             return null
         }
 
-        if (!hasWakeWord) return null
+        if (!hasWakeWord && !isAwakeForCommand) return null
 
-        // Wake word was spoken!
+        // Either wake word was spoken in this utterance OR user already said "Jolt" <8s ago!
         if (tokens.contains("angel")) {
             return VoiceCommand.AngelVehicle(descriptorNotes = descriptorNotes)
         }
@@ -148,6 +172,11 @@ object VoiceCommandParser {
                 severityOverride = severityOverride,
                 descriptorNotes = descriptorNotes
             )
+        }
+
+        // User said "Jolt" / "Hey Jolt" by itself (or paused after "Jolt, ...") -> acknowledge & stay awake!
+        if (hasWakeWord) {
+            return VoiceCommand.WakeDetected
         }
 
         return null
@@ -172,7 +201,6 @@ object VoiceCommandParser {
     }
 
     private fun extractSeverityOverride(tokens: List<String>, cleaned: String): JoltSeverity? {
-        // Avoid treating "red car/suv/truck/sedan" as a severity override unless "mark red" is said
         if (tokens.contains("maroon")) return JoltSeverity.MAROON
         if (tokens.contains("orange")) return JoltSeverity.ORANGE
         if (tokens.contains("yellow")) return JoltSeverity.YELLOW
@@ -188,9 +216,6 @@ object VoiceCommandParser {
 
 /**
  * Offline always-ready wake-phrase & command controller powered by Vosk (`model-en-us` in assets).
- *
- * Runs at 16 kHz mono PCM on an efficiency core (~3–5% CPU, zero GPU contention with YOLO/MMC),
- * never plays OS recognition chimes, and pauses microphone ingestion whenever TTS speaks.
  */
 class VoskVoiceController(
     context: Context,
@@ -200,6 +225,7 @@ class VoskVoiceController(
     enum class State {
         INITIALIZING,
         LISTENING,
+        AWAKE_COMMAND,
         AWAITING_REASON,
         MUTED_BY_USER,
         UNAVAILABLE
@@ -220,6 +246,9 @@ class VoskVoiceController(
 
     @Volatile
     private var ttsSpeaking = false
+
+    @Volatile
+    private var awakeUntilMs: Long = 0L
 
     @Volatile
     private var awaitingReasonUntilMs: Long = 0L
@@ -263,14 +292,29 @@ class VoskVoiceController(
         }
     }
 
-    /** Opens a 6-second follow-up window after "Jolt, flag that car" so user can state the reason. */
-    fun openFollowUpReasonWindow(durationMs: Long = 6_500L) {
+    /** Opens an 8-second awake command window after hearing "Jolt" so any action word fires immediately. */
+    fun openAwakeCommandWindow(durationMs: Long = 8_500L) {
+        awakeUntilMs = System.currentTimeMillis() + durationMs
+        updatePublishedState()
+    }
+
+    fun closeAwakeCommandWindow() {
+        awakeUntilMs = 0L
+        updatePublishedState()
+    }
+
+    fun isAwakeForCommand(): Boolean = System.currentTimeMillis() < awakeUntilMs
+
+    /** Opens a 7-second follow-up window after "Jolt, flag that car" so user can state the reason. */
+    fun openFollowUpReasonWindow(durationMs: Long = 7_500L) {
         awaitingReasonUntilMs = System.currentTimeMillis() + durationMs
+        awakeUntilMs = 0L
         updatePublishedState()
     }
 
     fun closeFollowUpReasonWindow() {
         awaitingReasonUntilMs = 0L
+        awakeUntilMs = 0L
         updatePublishedState()
     }
 
@@ -308,13 +352,22 @@ class VoskVoiceController(
         _state.value = when {
             userMuted -> State.MUTED_BY_USER
             isAwaitingFollowUpReason() -> State.AWAITING_REASON
+            isAwakeForCommand() -> State.AWAKE_COMMAND
             else -> State.LISTENING
         }
     }
 
     override fun onPartialResult(hypothesis: String?) {
-        // Refresh state if follow-up window expired naturally
-        if (_state.value == State.AWAITING_REASON && !isAwaitingFollowUpReason()) {
+        if (ttsSpeaking || userMuted || !tabActive) return
+        val partial = VoiceCommandParser.extractTextFromVoskJson(hypothesis)
+        if (partial.isNotEmpty() && VoiceCommandParser.containsWakeToken(partial)) {
+            // Immediately light up the awake state as soon as "Jolt" is heard mid-sentence!
+            if (!isAwakeForCommand() && !isAwaitingFollowUpReason()) {
+                openAwakeCommandWindow()
+            }
+        } else if ((_state.value == State.AWAITING_REASON && !isAwaitingFollowUpReason()) ||
+            (_state.value == State.AWAKE_COMMAND && !isAwakeForCommand())
+        ) {
             updatePublishedState()
         }
     }
@@ -330,17 +383,30 @@ class VoskVoiceController(
     private fun handleFinalHypothesis(hypothesis: String?) {
         if (ttsSpeaking || userMuted || !tabActive) return
         val text = VoiceCommandParser.extractTextFromVoskJson(hypothesis)
-        if (text.isEmpty() || text == "[unk]") return
+        if (text.isEmpty() || text == "[unk]") {
+            updatePublishedState()
+            return
+        }
 
         val now = System.currentTimeMillis()
-        if (text == lastDispatchedText && now - lastDispatchedAtMs < 1_200L) return
+        if (text == lastDispatchedText && now - lastDispatchedAtMs < 1_000L) return
 
         val awaiting = isAwaitingFollowUpReason()
-        val cmd = VoiceCommandParser.parse(text, awaitingFollowUpReason = awaiting)
+        val awake = isAwakeForCommand()
+        val cmd = VoiceCommandParser.parse(
+            rawTranscript = text,
+            awaitingFollowUpReason = awaiting,
+            isAwakeForCommand = awake
+        )
         if (cmd != null) {
             lastDispatchedText = text
             lastDispatchedAtMs = now
-            Log.i(TAG, "Voice command matched: $cmd (raw='$text', followUp=$awaiting)")
+            if (cmd is VoiceCommand.WakeDetected) {
+                openAwakeCommandWindow()
+            } else {
+                closeAwakeCommandWindow()
+            }
+            Log.i(TAG, "Voice command matched: $cmd (raw='$text', awake=$awake, followUp=$awaiting)")
             onCommand(cmd, text)
         } else {
             Log.d(TAG, "Ignored non-wake speech: '$text'")

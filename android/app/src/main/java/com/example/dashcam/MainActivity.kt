@@ -551,6 +551,7 @@ fun MainScreen(
 
                 val (voiceLabel, voiceColor) = when (voiceState) {
                     VoskVoiceController.State.LISTENING       -> "🎙 SAY \"JOLT…\"" to MaterialTheme.colorScheme.secondary
+                    VoskVoiceController.State.AWAKE_COMMAND   -> "🎙 LISTENING — SAY COMMAND…" to JoltColors.alertYellow
                     VoskVoiceController.State.AWAITING_REASON -> "🎙 REASON?" to JoltColors.alertYellow
                     VoskVoiceController.State.MUTED_BY_USER   -> "🔇 MIC MUTED" to Color.Gray
                     VoskVoiceController.State.INITIALIZING    -> "🎙 VOICE INIT…" to MaterialTheme.colorScheme.tertiary

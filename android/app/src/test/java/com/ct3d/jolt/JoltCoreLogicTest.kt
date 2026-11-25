@@ -177,10 +177,26 @@ class JoltCoreLogicTest {
         assertTrue(angel is VoiceCommand.AngelVehicle)
         assertEquals("silver sedan", (angel as VoiceCommand.AngelVehicle).descriptorNotes)
 
+        // Standalone wake word ("Jolt") opens awake window!
+        assertEquals(
+            VoiceCommand.WakeDetected,
+            VoiceCommandParser.parse("jolt", awaitingFollowUpReason = false, isAwakeForCommand = false)
+        )
+
+        // Subsequent action word without repeating "Jolt" while in 8s awake window fires immediately!
+        val awakeCmd = VoiceCommandParser.parse(
+            "weaving",
+            awaitingFollowUpReason = false,
+            isAwakeForCommand = true
+        ) as? VoiceCommand.FlagVehicle
+        assertNotNull(awakeCmd)
+        assertEquals(listOf(BehaviorTag.WEAVING), awakeCmd!!.tags)
+
         // Wrong car / cancel
         assertEquals(VoiceCommand.UndoOrWrongCar, VoiceCommandParser.parse("jolt wrong car", awaitingFollowUpReason = false))
         assertEquals(VoiceCommand.UndoOrWrongCar, VoiceCommandParser.parse("cancel", awaitingFollowUpReason = true))
         assertEquals(VoiceCommand.MuteAlerts, VoiceCommandParser.parse("jolt mute alerts", awaitingFollowUpReason = false))
+        assertEquals(VoiceCommand.UnmuteAlerts, VoiceCommandParser.parse("jolt alerts on", awaitingFollowUpReason = false))
     }
 
     @Test

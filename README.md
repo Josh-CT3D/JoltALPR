@@ -3,19 +3,22 @@
 A vehicle-mounted Automatic License Plate Reader (ALPR) for US plates, running as a native
 Android app entirely on-device. No internet connection required for any core function.
 
-**Use case:** personal safety. Flag a driver who cuts you off or drives dangerously; if their
-plate is ever read again, Jolt raises an on-screen alert — a pulsing yellow border, a warning
-card, and a haptic buzz — entirely from a local on-device database. No cloud, no accounts, no
-network calls.
+**Use case:** personal road-neighbor awareness. Flag a vehicle by hands-free voice command (or
+touch fallback) for risky or discourteous behavior (`Weaving`, `Unsteady Throttle`, `Cutting`,
+`Tailgating`, `Speed`, `No Lane`, `No Plate`, `Asshole`) or mark courteous drivers as **`★ Angel`**.
+When a previously recorded plate is recognized again, Jolt raises a severity-coded Tactical HUD
+(**Maroon / Red / Orange / Yellow / Angel Green**), haptic pattern, and spoken TTS alert (*"Red.
+Weaver."*) — entirely from a local on-device Room database.
 
 ## How it works
 
-The app watches the road through the phone's telephoto lens, runs a locally-trained YOLOv8
-model to find license plates in each frame, and reads them with on-device OCR (Google ML Kit,
-fully offline). When a plate can't be read — glare, angle, distance — a second model falls back
-to guessing the vehicle's make and model instead of showing nothing. A **FLAG BAD DRIVER**
-button saves the current plate/vehicle guess, a GPS fix, and a photo of the plate to a local
-database. Every subsequent plate read is checked against that database in real time.
+The app watches the road through the phone's 5× telephoto lens, runs a locally-trained YOLOv8n
+model on the GPU delegate to detect up to 3 license plates per frame, and reads them with
+on-device OCR (Google ML Kit, fully offline) using multi-frame consensus voting and confusion-folded
+plate matching. When a plate can't be read — glare, angle, distance, or tinted cover — a second
+GPU-accelerated model (EfficientNet-B0) classifies the vehicle's make and model from a
+plate-anchored crop. Hands-free voice commands are spotted locally at 16 kHz via Vosk constrained
+grammar with zero cloud calls.
 
 ## Hardware
 
@@ -64,11 +67,16 @@ The app degrades gracefully if optional models (`mmc_classifier.tflite` or `mode
 ## Hands-Free Voice Commands & Tactical HUD
 
 Say **"Jolt"** (or **"Hey Jolt"**) while on the **Main** tab:
-- **One-shot flagging:** `"Jolt, flag weaving"`, `"Jolt, flag white SUV cutting and asshole"`, `"Jolt, flag tailgating"`
+- **Standalone wake + 8s command window:** Say `"Jolt"` → chime + yellow `🎙 LISTENING — SAY COMMAND…` badge → say `"weaving"`, `"cutting"`, `"angel"`, `"cancel"`, etc.
+- **One-shot flagging:** `"Jolt, flag weaving"`, `"Jolt, flag white Honda SUV cutting and asshole"`, `"Jolt, flag tailgating"`
 - **Two-step conversational flagging:** `"Jolt, flag that car"` → Jolt reads the plate aloud (`"Plate L T 2 3 7 9. Reason?"`) → reply within 7 seconds (`"Line cutter"`, `"Unsteady throttle"`, `"No plate"`, etc.)
 - **Positive Angel mark:** `"Jolt, angel that car"` (permanent green goodwill badge alongside any history)
-- **Corrections & mute:** `"Jolt, wrong car"` / `"Jolt, cancel"` (undoes the last flag or suppresses an active alert), `"Jolt, mute alerts"` / `"Jolt, unmute alerts"`
+- **Corrections & mute:** `"Jolt, wrong car"` / `"Jolt, cancel"` (undoes the last flag or suppresses an active alert), `"Jolt, mute alerts"` / `"Jolt, alerts on"`
 - **Repeat-encounter Tactical HUD:** Displays severity color (**Maroon / Red / Orange / Yellow / Angel Green**), behavior code, incident count pips (`● ●`), Angel halo (`★ ANGEL`), match certainty, and concise spoken TTS alerts (*"Red. Weaver."*).
+
+## Field Telemetry & Soak Logger
+
+For untethered road validation without USB `adb`, toggle **Field Telemetry Logger** ON in the **Export** tab before driving. It records per-frame YOLO/OCR/MMC latencies, GPU delegate status, dropped frames, `PowerManager` thermal status & 10s thermal headroom, battery % and °C, Java/native heap MB, GPS speed (mph), and voice/flag actions to disk, and exports a self-contained `.txt` report with an Executive Summary Header to `Downloads/`.
 
 ## Models
 
@@ -86,7 +94,8 @@ project.
 
 ## Status
 
-Core plate detection, OCR, known-bad-driver alerting, GPS mapping, and the vehicle-fallback
-model are working and verified on-device. Training-data collection mode and its Google Drive
-export path are implemented but not yet field-validated. See in-repo commit history for the
-detailed changelog.
+Core plate detection, multi-plate OCR voting, confusion-tolerant matching, Tactical HUD & TTS
+alerts, offline Vosk hands-free voice control, 8-tag behavior & Angel reputation system (Room v6),
+OSMDroid street-map pin caching, DB+crops ZIP backup, and the Field Telemetry Logger are
+implemented, unit-tested, and verified on-device (Pixel 10). Real-world road soak & telemetry
+validation is in progress.

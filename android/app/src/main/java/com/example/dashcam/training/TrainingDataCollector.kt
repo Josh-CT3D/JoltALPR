@@ -9,26 +9,16 @@ import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 /**
- * Phase 6 — Training Data Collector
+ * Phase 6 + Phase 2.1 — Asynchronous Training Data Collector
  *
- * When Training Mode is enabled in the app, this class is called by TelephotoAnalyzer
- * every time the LP detection model fires with confidence ≥ 0.7.
- *
- * Saves two files per capture to filesDir/training_data/<timestamp>/:
- *   - <timestamp>.jpg  — full camera frame (A6 removed the ROI crop) at full resolution
- *   - <timestamp>.txt  — YOLO-format annotation:
- *                          0 <x_center> <y_center> <width> <height>  (all normalized 0-1)
- *                          class 0 = license_plate
- *
- * The resulting folder structure is Roboflow-compatible when zipped by TrainingExportWorker:
- *   images/<timestamp>.jpg
- *   labels/<timestamp>.txt
- *
- * Usage: set [TelephotoAnalyzer.trainingCallback] = collector::onPlateDetected
+ * Saves full-frame JPEGs + multi-box YOLO annotations on a dedicated background I/O thread so
+ * JPEG compression (`~80-110ms`) never stalls `jolt-pipeline` during road drives.
  */
 class TrainingDataCollector(private val context: Context) {
 
@@ -38,15 +28,19 @@ class TrainingDataCollector(private val context: Context) {
     @Volatile
     private var lastSavedBox: RectF? = null
 
+    private val ioExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "jolt-training-writer").apply { isDaemon = true }
+    }
+
     /**
-     * Called by TelephotoAnalyzer when confident plates are detected in Training Mode.
-     * Writes ALL confident boxes in the frame to the YOLO label file so secondary plates aren't
-     * taught as false negatives, and throttles near-duplicate static frames (e.g. stopped at lights).
+     * Checks deduplication synchronously on the caller thread, copies [frameBitmap] ONLY when a
+     * sample is accepted, and dispatches JPEG compression + disk write asynchronously so
+     * `jolt-pipeline` returns immediately.
      *
-     * @return true if a new sample was written, false if skipped by deduplication or error.
+     * @return true if accepted and queued for background save, false if deduplicated/throttled.
      */
     fun onPlateDetected(frameBitmap: Bitmap, plateBoxes: List<RectF>): Boolean {
-        if (plateBoxes.isEmpty()) return false
+        if (plateBoxes.isEmpty() || frameBitmap.isRecycled) return false
 
         val now = System.currentTimeMillis()
         val primaryBox = plateBoxes.first()
@@ -57,35 +51,50 @@ class TrainingDataCollector(private val context: Context) {
             return false
         }
 
-        val dir = File(context.filesDir, "training_data/$now").also { it.mkdirs() }
-
-        return try {
-            val jpegFile = File(dir, "$now.jpg")
-            FileOutputStream(jpegFile).use { out ->
-                frameBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-            }
-
-            val fw = frameBitmap.width.toFloat()
-            val fh = frameBitmap.height.toFloat()
-            val yoloLines = plateBoxes.joinToString("\n") { box ->
-                val xCenter = (((box.left + box.right) / 2f) / fw).coerceIn(0f, 1f)
-                val yCenter = (((box.top + box.bottom) / 2f) / fh).coerceIn(0f, 1f)
-                val width   = ((box.right - box.left) / fw).coerceIn(0f, 1f)
-                val height  = ((box.bottom - box.top) / fh).coerceIn(0f, 1f)
-                "0 $xCenter $yCenter $width $height"
-            } + "\n"
-
-            val labelFile = File(dir, "$now.txt")
-            labelFile.writeText(yoloLines)
-
-            lastSavedAtMs = now
-            lastSavedBox = RectF(primaryBox)
-            Log.i(TAG, "Training sample saved: $now (${plateBoxes.size} boxes)")
-            true
+        val frameCopy = try {
+            frameBitmap.copy(frameBitmap.config ?: Bitmap.Config.ARGB_8888, false)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to save training sample: ${e.localizedMessage}", e)
-            dir.deleteRecursively()
-            false
+            Log.w(TAG, "Could not copy frame for training sample: ${e.message}")
+            null
+        } ?: return false
+
+        val boxesCopy = plateBoxes.map { RectF(it) }
+        lastSavedAtMs = now
+        lastSavedBox = RectF(primaryBox)
+
+        try {
+            ioExecutor.execute {
+                val dir = File(context.filesDir, "training_data/$now").also { it.mkdirs() }
+                try {
+                    val jpegFile = File(dir, "$now.jpg")
+                    FileOutputStream(jpegFile).use { out ->
+                        frameCopy.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                    }
+
+                    val fw = frameCopy.width.toFloat()
+                    val fh = frameCopy.height.toFloat()
+                    val yoloLines = boxesCopy.joinToString("\n") { box ->
+                        val xCenter = (((box.left + box.right) / 2f) / fw).coerceIn(0f, 1f)
+                        val yCenter = (((box.top + box.bottom) / 2f) / fh).coerceIn(0f, 1f)
+                        val width   = ((box.right - box.left) / fw).coerceIn(0f, 1f)
+                        val height  = ((box.bottom - box.top) / fh).coerceIn(0f, 1f)
+                        "0 $xCenter $yCenter $width $height"
+                    } + "\n"
+
+                    val labelFile = File(dir, "$now.txt")
+                    labelFile.writeText(yoloLines)
+                    Log.i(TAG, "Training sample saved async: $now (${boxesCopy.size} boxes)")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to save training sample: ${e.localizedMessage}", e)
+                    dir.deleteRecursively()
+                } finally {
+                    if (!frameCopy.isRecycled) frameCopy.recycle()
+                }
+            }
+            return true
+        } catch (e: Exception) {
+            if (!frameCopy.isRecycled) frameCopy.recycle()
+            return false
         }
     }
 
@@ -102,20 +111,13 @@ class TrainingDataCollector(private val context: Context) {
         return if (union > 0f) inter / union else 0f
     }
 
-    /** Returns the total number of collected training samples. */
     fun sampleCount(): Int {
         val root = File(context.filesDir, "training_data")
         return root.listFiles()?.count { it.isDirectory } ?: 0
     }
 
-    /**
-     * Bundles every collected sample into a Roboflow/YOLO-compatible ZIP
-     * (images/<ts>.jpg + labels/<ts>.txt) and writes it to Downloads/ via MediaStore (works on
-     * API 31+ with no storage permission). Google Drive's Downloads sync then carries it to the PC.
-     * Returns the ZIP file name on success, or null if there was nothing to export or it failed.
-     * Runs blocking I/O — call off the main thread.
-     */
     fun exportZipToDownloads(): String? {
+        flushPendingWrites()
         val root = File(context.filesDir, "training_data")
         val sampleDirs = root.listFiles()?.filter { it.isDirectory }.orEmpty()
         if (sampleDirs.isEmpty()) {
@@ -133,23 +135,22 @@ class TrainingDataCollector(private val context: Context) {
             ?: return null
 
         return try {
-            // R5: a null stream is a real failure — don't fall through and report false success.
             val stream = context.contentResolver.openOutputStream(uri)
                 ?: throw IOException("Could not open output stream for $uri")
             stream.use { os ->
                 ZipOutputStream(os.buffered()).use { zip ->
                     sampleDirs.forEach { dir ->
-                        dir.listFiles()?.forEach { f ->
-                            val entryName = when {
-                                f.name.endsWith(".jpg") -> "images/${f.name}"
-                                f.name.endsWith(".txt") -> "labels/${f.name}"
-                                else -> null
-                            }
-                            if (entryName != null) {
-                                zip.putNextEntry(ZipEntry(entryName))
-                                f.inputStream().use { it.copyTo(zip) }
-                                zip.closeEntry()
-                            }
+                        val ts = dir.name
+                        val jpg = File(dir, "$ts.jpg")
+                        val txt = File(dir, "$ts.txt")
+                        if (jpg.exists() && txt.exists()) {
+                            zip.putNextEntry(ZipEntry("images/$ts.jpg"))
+                            jpg.inputStream().use { it.copyTo(zip) }
+                            zip.closeEntry()
+
+                            zip.putNextEntry(ZipEntry("labels/$ts.txt"))
+                            txt.inputStream().use { it.copyTo(zip) }
+                            zip.closeEntry()
                         }
                     }
                 }
@@ -157,24 +158,30 @@ class TrainingDataCollector(private val context: Context) {
             Log.i(TAG, "Exported ${sampleDirs.size} training samples to Downloads/$zipName")
             zipName
         } catch (e: Exception) {
-            Log.e(TAG, "Training ZIP export failed: ${e.localizedMessage}", e)
-            // R5: delete the MediaStore row we inserted so it doesn't linger as a 0-byte download.
+            Log.e(TAG, "Training export failed: ${e.localizedMessage}", e)
             try { context.contentResolver.delete(uri, null, null) } catch (_: Exception) {}
             null
         }
     }
 
-    /** Deletes all collected training data. */
     fun clearAll() {
-        val root = File(context.filesDir, "training_data")
-        root.deleteRecursively()
-        Log.i(TAG, "Training data cleared.")
+        flushPendingWrites()
+        File(context.filesDir, "training_data").deleteRecursively()
+        lastSavedAtMs = 0L
+        lastSavedBox = null
+        Log.i(TAG, "All collected training samples deleted.")
+    }
+
+    private fun flushPendingWrites() {
+        try {
+            ioExecutor.submit {}.get(3, TimeUnit.SECONDS)
+        } catch (_: Exception) {}
     }
 
     companion object {
         private const val TAG = "TrainingDataCollector"
         private const val MIN_SAMPLE_INTERVAL_MS = 1_500L
-        private const val DEDUP_WINDOW_MS = 4_000L
-        private const val DEDUP_IOU_THRESHOLD = 0.85f
+        private const val DEDUP_WINDOW_MS = 10_000L
+        private const val DEDUP_IOU_THRESHOLD = 0.65f
     }
 }

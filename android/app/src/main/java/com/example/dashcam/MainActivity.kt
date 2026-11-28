@@ -4,13 +4,18 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.hardware.camera2.CameraCharacteristics
+import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Log
+import android.util.LruCache
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -40,9 +45,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size as GeoSize
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
@@ -52,20 +59,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.util.LruCache
 import com.ct3d.jolt.camera.PlateBox
 import com.ct3d.jolt.camera.TelephotoAnalyzer
 import com.ct3d.jolt.data.BehaviorTag
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.JoltSeverity
+import com.ct3d.jolt.data.PartialMatchEngine
+import com.ct3d.jolt.data.TrendsAnalyticsEngine
 import com.ct3d.jolt.data.VehicleReputation
 import com.ct3d.jolt.speech.VoskVoiceController
 import com.ct3d.jolt.ui.DashcamViewModel
@@ -87,26 +92,14 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 /**
- * Main Activity — Jolt ALPR Dashcam
- *
- * UI: portrait single-column layout with a 5-tab bottom navigation bar
- * (Main / Map / History / Export / Manage). The Main tab hosts the live camera preview,
- * the green bounding-box overlay, the OCR chip, and the large red FLAG BAD DRIVER button;
- * the map lives on its own Map tab.
- *
- * Voice commands removed — physical button only.
+ * Main Activity — Jolt ALPR Road-Neighbor Awareness System (Phase 2.1 + Phase 3).
  */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: DashcamViewModel by viewModels()
     private lateinit var cameraExecutor: ExecutorService
 
-    // R12: Compose state, NOT a plain var. On a fresh install permissions aren't granted yet, so
-    // setupServices() runs later from the async permission-result callback — after setContent has
-    // already composed. A plain var never notifies composition, so CameraPreviewWidget would read
-    // null forever and ImageAnalysis would never get an analyzer attached (preview still renders,
-    // so the failure is completely silent). Backing this with mutableStateOf makes the later
-    // assignment recompose the camera widget, which then attaches the analyzer.
+    // R12: Compose state, NOT a plain var (DO NOT REVERT).
     private var telephotoAnalyzer by mutableStateOf<TelephotoAnalyzer?>(null)
 
     private val requiredPermissions = arrayOf(
@@ -131,8 +124,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Keep the screen awake while mounted — no touches happen during a drive (closes the
-        // Phase 7 "always-on screen" backlog item). Cleared automatically when the activity stops.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -188,13 +179,15 @@ class MainActivity : ComponentActivity() {
                 lifecycleScope.launch {
                     analyzer.pipelineState.collect { state ->
                         viewModel.updateActiveDetection(
-                            plateOcr        = state.activePlateocr,
-                            vehicleMmc      = state.activeVehicleMmc,
-                            plateBoxes      = state.plateBoxes,
-                            plateCrop       = state.lastPlateCrop,
-                            confirmedPlates = state.confirmedPlateTokens,
-                            frameWidth      = state.frameWidth,
-                            frameHeight     = state.frameHeight
+                            plateOcr         = state.activePlateocr,
+                            vehicleMmc       = state.activeVehicleMmc,
+                            plateBoxes       = state.plateBoxes,
+                            plateCrop        = state.lastPlateCrop,
+                            confirmedPlates  = state.confirmedPlateTokens,
+                            frameWidth       = state.frameWidth,
+                            frameHeight      = state.frameHeight,
+                            activeAppearance = state.activeAppearance,
+                            partialPlateHint = state.partialPlateHint
                         )
                     }
                 }
@@ -215,8 +208,6 @@ class MainActivity : ComponentActivity() {
     companion object { private const val TAG = "MainActivity" }
 }
 
-// Theme moved to ui/theme/Theme.kt + ui/theme/Color.kt (A12).
-
 // ─────────────────────────────────────────────────────────────────────────────
 // Root app with bottom navigation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -233,6 +224,7 @@ fun JoltApp(
     val plateBoxes         by viewModel.plateBoxes.collectAsState()
     val frameAspectRatio   by viewModel.frameAspectRatio.collectAsState()
     val logList            by viewModel.logsList.collectAsState()
+    val trendsReport       by viewModel.trendsReport.collectAsState()
     val gpsLocation        by viewModel.currentLocation.collectAsState()
     val bannerNotification by viewModel.notificationMessage.collectAsState()
     val badDriverAlert     by viewModel.knownBadDriverAlert.collectAsState()
@@ -250,85 +242,90 @@ fun JoltApp(
         }
     }
 
-    // Wrap everything in a Box so the alert border can float above the Scaffold
     Box(modifier = Modifier.fillMaxSize()) {
-    Scaffold(
-        bottomBar = {
-            NavigationBar(
-                containerColor = JoltColors.navBar,
-                tonalElevation = 0.dp,
-                modifier = Modifier.height(80.dp)
+        Scaffold(
+            bottomBar = {
+                NavigationBar(
+                    containerColor = JoltColors.navBar,
+                    tonalElevation = 0.dp,
+                    modifier = Modifier.height(80.dp)
+                ) {
+                    JoltNavItem(0, selectedTab, { selectTab(0, "Main") },    Icons.Default.Videocam,     "Main")
+                    JoltNavItem(1, selectedTab, { selectTab(1, "Map") },     Icons.Default.Map,          "Map")
+                    JoltNavItem(2, selectedTab, { selectTab(2, "History") }, Icons.Default.Assessment,   "History")
+                    JoltNavItem(3, selectedTab, { selectTab(3, "Export") },  Icons.Default.FileDownload, "Export")
+                    JoltNavItem(4, selectedTab, { selectTab(4, "Manage") },  Icons.Default.ManageSearch, "Manage")
+                }
+            }
+        ) { paddingValues ->
+            Box(
+                modifier = Modifier
+                    .padding(paddingValues)
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
             ) {
-                JoltNavItem(0, selectedTab, { selectTab(0, "Main") },    Icons.Default.Videocam,      "Main")
-                JoltNavItem(1, selectedTab, { selectTab(1, "Map") },     Icons.Default.Map,           "Map")
-                JoltNavItem(2, selectedTab, { selectTab(2, "History") }, Icons.Default.List,          "History")
-                JoltNavItem(3, selectedTab, { selectTab(3, "Export") },  Icons.Default.FileDownload,  "Export")
-                JoltNavItem(4, selectedTab, { selectTab(4, "Manage") },  Icons.Default.ManageSearch,  "Manage")
+                when (selectedTab) {
+                    0 -> MainScreen(
+                        activeOcr             = activeOcr,
+                        activeMmc             = activeMmc,
+                        plateBoxes            = plateBoxes,
+                        frameAspectRatio      = frameAspectRatio,
+                        voiceState            = voiceState,
+                        onToggleVoiceMute     = viewModel::toggleVoiceMute,
+                        recentFlagState       = recentFlagState,
+                        onToggleQuickTag      = viewModel::toggleQuickTagOnRecentFlag,
+                        onUndoRecentFlag      = { viewModel.undoLastAction(fromVoice = false) },
+                        telemetryRecording    = telemetryEnabled,
+                        bannerNotification    = bannerNotification,
+                        onDismissNotification = viewModel::dismissNotification,
+                        onFlagBadDriver       = { viewModel.flagBadDriver() },
+                        onFlagAngel           = { viewModel.flagAngelDriver() },
+                        getAnalyzer           = getAnalyzer
+                    )
+                    1 -> JoltMapScreen(
+                        logs            = logList,
+                        currentLocation = gpsLocation
+                    )
+                    2 -> HistoryAndTrendsScreen(
+                        logList        = logList,
+                        trendsReport   = trendsReport,
+                        onSaveEdits    = viewModel::saveIncidentReviewEdits,
+                        onDeleteRecord = viewModel::deleteLogItem
+                    )
+                    3 -> ExportScreen(
+                        logList             = logList,
+                        trustedUnitId       = viewModel.trustedUnitId,
+                        onExportGroupBundle = viewModel::exportTrustedGroupBundle,
+                        onImportGroupBundle = viewModel::importTrustedGroupBundle,
+                        trainingMode        = trainingMode,
+                        trainingCount       = trainingCount,
+                        onToggleTraining    = viewModel::toggleTrainingMode,
+                        onExportTraining    = viewModel::exportTrainingData,
+                        onClearTraining     = viewModel::clearTrainingData,
+                        telemetryEnabled    = telemetryEnabled,
+                        telemetryCount      = telemetryCount,
+                        onToggleTelemetry   = viewModel::toggleTelemetryLogging,
+                        onExportTelemetry   = viewModel::exportTelemetryReport,
+                        onClearTelemetry    = viewModel::clearTelemetryLogs,
+                        onBackupDatabase    = viewModel::backupDatabase
+                    )
+                    4 -> ManageScreen(
+                        logList     = logList,
+                        onDeleteLog = viewModel::deleteLogItem,
+                        onClearAll  = viewModel::clearLogs
+                    )
+                }
             }
         }
-    ) { paddingValues ->
-        Box(
-            modifier = Modifier
-                .padding(paddingValues)
-                .fillMaxSize()
-                .background(MaterialTheme.colorScheme.background)
-        ) {
-            when (selectedTab) {
-                0 -> MainScreen(
-                    activeOcr             = activeOcr,
-                    activeMmc             = activeMmc,
-                    plateBoxes            = plateBoxes,
-                    frameAspectRatio      = frameAspectRatio,
-                    voiceState            = voiceState,
-                    onToggleVoiceMute     = viewModel::toggleVoiceMute,
-                    recentFlagState       = recentFlagState,
-                    onToggleQuickTag      = viewModel::toggleQuickTagOnRecentFlag,
-                    onUndoRecentFlag      = { viewModel.undoLastAction(fromVoice = false) },
-                    telemetryRecording    = telemetryEnabled,
-                    bannerNotification    = bannerNotification,
-                    onDismissNotification = viewModel::dismissNotification,
-                    onFlagBadDriver       = { viewModel.flagBadDriver() },
-                    onFlagAngel           = { viewModel.flagAngelDriver() },
-                    getAnalyzer           = getAnalyzer
-                )
-                1 -> JoltMapScreen(
-                    logs            = logList,
-                    currentLocation = gpsLocation
-                )
-                2 -> HistoryScreen(logList = logList)
-                3 -> ExportScreen(
-                    logList           = logList,
-                    trainingMode      = trainingMode,
-                    trainingCount     = trainingCount,
-                    onToggleTraining  = viewModel::toggleTrainingMode,
-                    onExportTraining  = viewModel::exportTrainingData,
-                    onClearTraining   = viewModel::clearTrainingData,
-                    telemetryEnabled  = telemetryEnabled,
-                    telemetryCount    = telemetryCount,
-                    onToggleTelemetry = viewModel::toggleTelemetryLogging,
-                    onExportTelemetry = viewModel::exportTelemetryReport,
-                    onClearTelemetry  = viewModel::clearTelemetryLogs,
-                    onBackupDatabase  = viewModel::backupDatabase
-                )
-                4 -> ManageScreen(
-                    logList     = logList,
-                    onDeleteLog = viewModel::deleteLogItem,
-                    onClearAll  = viewModel::clearLogs
-                )
-            }
-        }
-    } // end Scaffold
 
-    // Phase 2 Tactical Encounter HUD — severity-coded pulsing border + pips + Angel status
-    val activeAlert = badDriverAlert
-    if (activeAlert != null) {
-        TacticalEncounterHud(
-            reputation = activeAlert,
-            onDismiss  = viewModel::dismissAlert
-        )
+        val activeAlert = badDriverAlert
+        if (activeAlert != null) {
+            TacticalEncounterHud(
+                reputation = activeAlert,
+                onDismiss  = viewModel::dismissAlert
+            )
+        }
     }
-
-    } // end outer Box
 }
 
 @Composable
@@ -341,12 +338,11 @@ private fun severityUiColor(severity: JoltSeverity): Color = when (severity) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Phase 2 Tactical Encounter HUD (Bounty-Hunter style severity + pips + certainty)
+// Phase 2 + Phase 3 Tactical Encounter HUD (Severity + Pips + Certainty)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
 fun TacticalEncounterHud(reputation: VehicleReputation, onDismiss: () -> Unit) {
-    // Auto-dismiss after 15 seconds
     LaunchedEffect(reputation.plateNormalized, reputation.latestIncidentTimestamp) {
         kotlinx.coroutines.delay(15_000L)
         onDismiss()
@@ -358,10 +354,11 @@ fun TacticalEncounterHud(reputation: VehicleReputation, onDismiss: () -> Unit) {
         else -> Color.Black
     }
 
+    val isSuspected = reputation.matchConfidence < 0.95f
     val infiniteTransition = rememberInfiniteTransition(label = "alert_pulse")
     val borderAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.35f,
-        targetValue  = 1.0f,
+        initialValue = if (isSuspected) 0.22f else 0.35f,
+        targetValue  = if (isSuspected) 0.78f else 1.0f,
         animationSpec = infiniteRepeatable(
             animation  = tween(450, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
@@ -370,14 +367,12 @@ fun TacticalEncounterHud(reputation: VehicleReputation, onDismiss: () -> Unit) {
     )
 
     Box(modifier = Modifier.fillMaxSize()) {
-        // Full-perimeter severity-colored pulsing border
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .border(Dimens.alertBorder, hudColor.copy(alpha = borderAlpha))
         )
 
-        // Compact Tactical HUD card at top-center
         Card(
             shape    = RoundedCornerShape(10.dp),
             colors   = CardDefaults.cardColors(containerColor = hudColor),
@@ -390,29 +385,33 @@ fun TacticalEncounterHud(reputation: VehicleReputation, onDismiss: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Icon(
-                    imageVector = if (reputation.isPureAngel) Icons.Default.Star else Icons.Default.Warning,
+                    imageVector = when {
+                        reputation.isPureAngel -> Icons.Default.Star
+                        isSuspected -> Icons.Default.HelpOutline
+                        else -> Icons.Default.Warning
+                    },
                     contentDescription = null,
                     tint = onHudTextColor,
                     modifier = Modifier.size(22.dp)
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f, fill = false)) {
-                    // Primary tactical line: SEVERITY • BEHAVIOR • INCIDENT PIPS
                     val pips = if (reputation.badIncidentCount > 0) {
                         val dots = "●".repeat(reputation.badIncidentCount.coerceAtMost(5))
                         val extra = if (reputation.badIncidentCount > 5) "+${reputation.badIncidentCount - 5}" else ""
                         "  $dots$extra"
                     } else ""
                     val halo = if (reputation.hasAngelHalo && !reputation.isPureAngel) "  ★ ANGEL" else ""
+                    val qMark = if (isSuspected) " ?" else ""
                     Text(
-                        text       = "${reputation.effectiveSeverity.displayLabel} • ${reputation.primaryHudBehavior}$pips$halo",
+                        text       = "${reputation.effectiveSeverity.displayLabel} • ${reputation.primaryHudBehavior}$pips$halo$qMark",
                         color      = onHudTextColor,
                         fontWeight = FontWeight.ExtraBold,
                         fontSize   = 13.sp,
                         fontFamily = FontFamily.Monospace
                     )
-                    val certaintyLabel = if (reputation.matchConfidence >= 0.95f) {
-                        "CONFIRMED PLATE: ${reputation.plateDisplay}"
+                    val certaintyLabel = if (!isSuspected) {
+                        "CONFIRMED: ${reputation.plateDisplay}"
                     } else {
                         "${(reputation.matchConfidence * 100).toInt()}% SUSPECTED: ${reputation.plateDisplay}"
                     }
@@ -457,7 +456,7 @@ private fun RowScope.JoltNavItem(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Main Screen: camera preview + bounding-box overlay + OCR chip + FLAG button (portrait)
+// Main Screen
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -483,7 +482,6 @@ fun MainScreen(
 
     Column(modifier = Modifier.fillMaxSize()) {
 
-        // Notification banner (slides in at top)
         AnimatedVisibility(visible = bannerNotification != null) {
             Surface(
                 color = MaterialTheme.colorScheme.tertiary,
@@ -507,7 +505,6 @@ fun MainScreen(
             }
         }
 
-        // ── Full-width camera preview — fills ~78% of remaining height ──
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -520,14 +517,12 @@ fun MainScreen(
                 analyzer             = getAnalyzer()
             )
 
-            // Green bounding boxes drawn over detected plates
             BoundingBoxOverlay(
                 boxes            = plateBoxes,
                 frameAspectRatio = frameAspectRatio,
                 modifier         = Modifier.fillMaxSize()
             )
 
-            // Lens + Hands-Free Voice indicator chips (top-left)
             Row(
                 modifier = Modifier
                     .align(Alignment.TopStart)
@@ -577,7 +572,6 @@ fun MainScreen(
                 }
             }
 
-            // Field Telemetry active indicator chip (top-right)
             if (telemetryRecording) {
                 Box(
                     modifier = Modifier
@@ -596,7 +590,6 @@ fun MainScreen(
                 }
             }
 
-            // OCR / MMC result chip (bottom of camera view)
             if (activeOcr != null || activeMmc != null) {
                 Box(
                     modifier = Modifier
@@ -631,7 +624,7 @@ fun MainScreen(
                                 textAlign  = TextAlign.Center
                             )
                             Text(
-                                text       = "MMC FALLBACK",
+                                text       = "VEHICLE APPEARANCE",
                                 color      = Color.Gray,
                                 fontSize   = 9.sp,
                                 fontFamily = FontFamily.Monospace,
@@ -643,7 +636,6 @@ fun MainScreen(
             }
         }
 
-        // Optional 7-second quick-tag chip bar after flagging (attach up to 2 behavior tags or Undo)
         AnimatedVisibility(visible = recentFlagState != null) {
             val rf = recentFlagState
             if (rf != null) {
@@ -682,7 +674,6 @@ fun MainScreen(
             }
         }
 
-        // ── Bottom Action Row: FLAG BAD DRIVER + ANGEL (fallback for voice) ──
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -740,7 +731,7 @@ fun MainScreen(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Map tab — full-screen OSMDroid map with flagged pins (Phase 4)
+// Map tab — OSMDroid map with severity-colored pins
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
@@ -748,29 +739,25 @@ fun JoltMapScreen(
     logs: List<DriverLog>,
     currentLocation: android.location.Location?
 ) {
-    // Hoist state so the re-center FAB can reset it
     var mapViewRef    by remember { mutableStateOf<MapView?>(null) }
     var userHasPanned by remember { mutableStateOf(false) }
+    val geoLogs = remember(logs) { logs.filter { it.latitude != 0.0 || it.longitude != 0.0 } }
 
-    // Drop the MapView reference when this screen leaves composition so we don't retain a
-    // detached OSMDroid view.
     DisposableEffect(Unit) {
         onDispose { mapViewRef = null }
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
-
         JoltMapView(
             modifier        = Modifier.fillMaxSize(),
-            logs            = logs,
+            logs            = geoLogs,
             currentLocation = currentLocation,
             userHasPanned   = userHasPanned,
             onUserPanned    = { userHasPanned = true },
             onMapReady      = { mapViewRef = it }
         )
 
-        // Empty-state hint (shown until the first flag is pressed)
-        if (logs.isEmpty()) {
+        if (geoLogs.isEmpty()) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopCenter)
@@ -788,8 +775,7 @@ fun JoltMapScreen(
             }
         }
 
-        // Flagged-capture count badge (top-right)
-        if (logs.isNotEmpty()) {
+        if (geoLogs.isNotEmpty()) {
             Box(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
@@ -798,7 +784,7 @@ fun JoltMapScreen(
                     .padding(horizontal = 10.dp, vertical = 4.dp)
             ) {
                 Text(
-                    text       = "${logs.size} FLAGGED",
+                    text       = "${geoLogs.size} MAPPED",
                     color      = Color.White,
                     fontSize   = 10.sp,
                     fontWeight = FontWeight.ExtraBold,
@@ -807,7 +793,6 @@ fun JoltMapScreen(
             }
         }
 
-        // Re-center FAB — snaps map back to current GPS after user panning
         FloatingActionButton(
             onClick = {
                 userHasPanned = false
@@ -837,13 +822,10 @@ fun JoltMapView(
     val lifecycleOwner = LocalLifecycleOwner.current
     val dateFormat     = remember { SimpleDateFormat("MM/dd  HH:mm", Locale.getDefault()) }
 
-    // Programmatic circular pins (R10): red for user BAD flags, amber for auto-logged SIGHTING
-    // re-encounters, so repeat sightings read differently from flags. Colors match History's rating
-    // labels (JoltRed / JoltColors.alertYellow).
     val makePin: (String) -> android.graphics.drawable.BitmapDrawable = { hexColor ->
         val dp  = context.resources.displayMetrics.density
         val sz  = (dp * 28).toInt()
-        val bmp = android.graphics.Bitmap.createBitmap(sz, sz, android.graphics.Bitmap.Config.ARGB_8888)
+        val bmp = Bitmap.createBitmap(sz, sz, Bitmap.Config.ARGB_8888)
         val cvs = android.graphics.Canvas(bmp)
         val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
         paint.color = android.graphics.Color.parseColor(hexColor)
@@ -854,18 +836,16 @@ fun JoltMapView(
         cvs.drawCircle(sz / 2f, sz / 2f, sz / 2f - dp * 2.5f, paint)
         android.graphics.drawable.BitmapDrawable(context.resources, bmp)
     }
-    val maroonPinDrawable = remember(context) { makePin("#AD1457") } // MAROON persistent threat
-    val redPinDrawable    = remember(context) { makePin("#FF1744") } // RED flag
-    val orangePinDrawable = remember(context) { makePin("#FF9100") } // ORANGE flag
-    val yellowPinDrawable = remember(context) { makePin("#FFD700") } // YELLOW / SIGHTING
-    val greenPinDrawable  = remember(context) { makePin("#00E676") } // ANGEL goodwill mark
+    val maroonPinDrawable = remember(context) { makePin("#AD1457") }
+    val redPinDrawable    = remember(context) { makePin("#FF1744") }
+    val orangePinDrawable = remember(context) { makePin("#FF9100") }
+    val yellowPinDrawable = remember(context) { makePin("#FFD700") }
+    val greenPinDrawable  = remember(context) { makePin("#00E676") }
 
-    // Holds the live MapView so the lifecycle observer below can actually pause/resume/detach it.
-    val mapViewHolder = remember { mutableStateOf<MapView?>(null) }
+    val mapViewHolder    = remember { mutableStateOf<MapView?>(null) }
     val lastRenderedLogs = remember { mutableStateOf<List<DriverLog>?>(null) }
     val lastCenteredLoc  = remember { mutableStateOf<android.location.Location?>(null) }
 
-    // Honour MapView pause/resume with the Activity lifecycle
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
@@ -886,11 +866,10 @@ fun JoltMapView(
         factory = { ctx ->
             MapView(ctx).also { mapView ->
                 mapView.setTileSource(TileSourceFactory.MAPNIK)
-                // Internet enabled for automatic street-map tile downloading & local tile caching.
                 mapView.setUseDataConnection(true)
                 mapView.setMultiTouchControls(true)
                 mapView.controller.setZoom(15.0)
-                mapView.controller.setCenter(GeoPoint(41.7658, -72.6734)) // Central CT default
+                mapView.controller.setCenter(GeoPoint(41.7658, -72.6734))
                 mapView.setOnTouchListener { v, _ ->
                     onUserPanned()
                     v.performClick()
@@ -933,7 +912,6 @@ fun JoltMapView(
                 mapView.invalidate()
             }
 
-            // Follow GPS until the user pans away, only animating when location actually updates
             if (!userHasPanned && currentLocation != null && currentLocation !== lastCenteredLoc.value) {
                 lastCenteredLoc.value = currentLocation
                 mapView.controller.animateTo(GeoPoint(currentLocation.latitude, currentLocation.longitude))
@@ -944,44 +922,656 @@ fun JoltMapView(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// History tab
+// Phase 3 History & Trends Screen (Parked Review + Search/Filter/Edit + Analytics)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
-fun HistoryScreen(logList: List<DriverLog>) {
+fun HistoryAndTrendsScreen(
+    logList: List<DriverLog>,
+    trendsReport: TrendsAnalyticsEngine.TrendsReport,
+    onSaveEdits: (DriverLog, String, String, String, String, List<BehaviorTag>, JoltSeverity, String) -> Unit,
+    onDeleteRecord: (DriverLog) -> Unit
+) {
+    var subTab by remember { mutableIntStateOf(0) } // 0 = Incidents, 1 = Trends
+    var searchQuery by remember { mutableStateOf("") }
+    var ratingFilter by remember { mutableStateOf("ALL") } // ALL, BAD, ANGEL, SIGHTING, PEER
+    var editingLog by remember { mutableStateOf<DriverLog?>(null) }
+
+    val activeEdit = editingLog
+    if (activeEdit != null) {
+        IncidentReviewEditDialog(
+            log      = activeEdit,
+            onDismiss = { editingLog = null },
+            onSave   = { plate, color, make, body, tags, sev, notes ->
+                onSaveEdits(activeEdit, plate, color, make, body, tags, sev, notes)
+                editingLog = null
+            },
+            onDelete = {
+                onDeleteRecord(activeEdit)
+                editingLog = null
+            }
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(16.dp)
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        // Segmented toggle: [ 📋 Incidents ] [ 📊 Trends ]
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(10.dp))
+                .padding(4.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            val tabItems = listOf("INCIDENTS (${logList.size})" to 0, "TRENDS & RATES" to 1)
+            tabItems.forEach { (title, idx) ->
+                val selected = subTab == idx
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(if (selected) MaterialTheme.colorScheme.primary else Color.Transparent)
+                        .clickable { subTab = idx }
+                        .padding(vertical = 9.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text       = title,
+                        color      = if (selected) Color.White else Color.Gray,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize   = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(10.dp))
+
+        if (subTab == 0) {
+            // Search box
+            OutlinedTextField(
+                value         = searchQuery,
+                onValueChange = { searchQuery = it },
+                placeholder   = { Text("Search plate, make, color, body, tag…", fontSize = 12.sp) },
+                leadingIcon   = { Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                trailingIcon  = {
+                    if (searchQuery.isNotEmpty()) {
+                        IconButton(onClick = { searchQuery = "" }, modifier = Modifier.size(24.dp)) {
+                            Icon(Icons.Default.Clear, contentDescription = "Clear")
+                        }
+                    }
+                },
+                singleLine = true,
+                modifier   = Modifier.fillMaxWidth()
+            )
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Quick filter chips
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                listOf("ALL", "BAD", "ANGEL", "SIGHTING", "PEER").forEach { key ->
+                    FilterChip(
+                        selected = ratingFilter == key,
+                        onClick  = { ratingFilter = key },
+                        label    = {
+                            Text(
+                                text       = if (key == "ANGEL") "★ ANGEL" else key,
+                                fontSize   = 10.sp,
+                                fontWeight = FontWeight.Bold,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            val filteredLogs = remember(logList, searchQuery, ratingFilter) {
+                val q = searchQuery.trim().lowercase()
+                logList.filter { row ->
+                    val matchesFilter = when (ratingFilter) {
+                        "BAD"      -> row.rating == "BAD"
+                        "ANGEL"    -> row.rating == "ANGEL"
+                        "SIGHTING" -> row.rating == "SIGHTING"
+                        "PEER"     -> row.reporterId != "LOCAL"
+                        else       -> true
+                    }
+                    if (!matchesFilter) return@filter false
+                    if (q.isEmpty()) return@filter true
+                    val haystack = listOfNotNull(
+                        row.plateOcr, row.plateNormalized, row.vehicleMmc,
+                        row.vehicleColor, row.vehicleMake, row.vehicleBodyStyle,
+                        row.behaviorTags, row.severity, row.notes, row.reporterId
+                    ).joinToString(" ").lowercase()
+                    haystack.contains(q)
+                }
+            }
+
+            if (filteredLogs.isEmpty()) {
+                EmptyState(
+                    icon = Icons.Default.List,
+                    text = if (logList.isEmpty()) {
+                        "No captures yet.\nSay \"Jolt, flag…\" on the Main tab."
+                    } else {
+                        "No records match your search/filter."
+                    }
+                )
+            } else {
+                Text(
+                    text       = "Tap any BAD / ANGEL card while parked to review or edit",
+                    color      = Color.Gray,
+                    fontSize   = 10.sp,
+                    fontFamily = FontFamily.Monospace,
+                    modifier   = Modifier.padding(bottom = 6.dp)
+                )
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    items(filteredLogs, key = { it.id }) { log ->
+                        DriverLogItemWidget(
+                            log     = log,
+                            onClick = if (log.rating != "SIGHTING") ({ editingLog = log }) else null
+                        )
+                    }
+                }
+            }
+        } else {
+            TrendsDashboardContent(report = trendsReport)
+        }
+    }
+}
+
+@Composable
+private fun TrendsDashboardContent(report: TrendsAnalyticsEngine.TrendsReport) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // 1. Overview Counters Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            MetricMiniCard("BAD FLAGS", report.totalBadIncidents.toString(), MaterialTheme.colorScheme.primary, Modifier.weight(1f))
+            MetricMiniCard("PLATES", report.uniqueFlaggedPlates.toString(), Color.White, Modifier.weight(1f))
+            MetricMiniCard("★ ANGELS", report.totalAngels.toString(), JoltColors.angelGreen, Modifier.weight(1f))
+            MetricMiniCard("SIGHTINGS", report.totalSightings.toString(), JoltColors.alertYellow, Modifier.weight(1f))
+        }
+
+        // 2. White SUV Hypothesis Spotlight Card
+        val ws = report.whiteSuvSpotlight
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape  = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    text       = "HYPOTHESIS TRACKER • WHITE SUVs",
+                    color      = MaterialTheme.colorScheme.tertiary,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize   = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(JoltColors.cardElevated, RoundedCornerShape(8.dp))
+                            .padding(10.dp)
+                    ) {
+                        Text("WHITE SUV", color = Color.Gray, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                        Text(
+                            text       = "${"%.1f".format(ws.whiteSuvRatePct)}%",
+                            color      = Color.White,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize   = 20.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text     = "${ws.flaggedWhiteSuvs} flagged / ${ws.observedWhiteSuvs} seen",
+                            color    = Color.Gray,
+                            fontSize = 10.sp
+                        )
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .background(JoltColors.cardElevated, RoundedCornerShape(8.dp))
+                            .padding(10.dp)
+                    ) {
+                        Text("ALL OTHER TRAFFIC", color = Color.Gray, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+                        Text(
+                            text       = "${"%.1f".format(ws.allOtherRatePct)}%",
+                            color      = Color.White,
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize   = 20.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            text     = "${ws.allOtherFlagged} flagged / ${ws.allOtherObserved} seen",
+                            color    = Color.Gray,
+                            fontSize = 10.sp
+                        )
+                    }
+                }
+                if (ws.relativeMultiplier > 0f) {
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text       = "Relative Rate: ${"%.2f".format(ws.relativeMultiplier)}× baseline encounter rate",
+                        color      = if (ws.relativeMultiplier >= 1.15f) JoltColors.severityOrange else JoltColors.angelGreen,
+                        fontSize   = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+        }
+
+        // 3. Central CT Make Watchlist (Honda / Acura / Infiniti)
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape  = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(14.dp)) {
+                Text(
+                    text       = "CENTRAL CT WATCHLIST (HONDA • ACURA • INFINITI)",
+                    color      = JoltColors.watchlistAccent,
+                    fontWeight = FontWeight.ExtraBold,
+                    fontSize   = 11.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                report.watchlistRows.forEach { row ->
+                    RateBarRow(row = row, accentColor = JoltColors.watchlistAccent)
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+            }
+        }
+
+        // 4. All Observed & Flagged Makes Leaderboard
+        if (report.makeLeaderboard.isNotEmpty()) {
+            AnalyticsSectionCard(
+                title = "INCIDENTS & RATE BY MAKE",
+                subtitle = "Shows both raw flags and normalized (flags ÷ encounters)",
+                rows = report.makeLeaderboard.take(10),
+                barColor = MaterialTheme.colorScheme.primary
+            )
+        }
+
+        // 5. Body Style & Paint Color Breakdown
+        if (report.bodyLeaderboard.isNotEmpty()) {
+            AnalyticsSectionCard(
+                title = "BY BODY STYLE",
+                subtitle = "SUV • Sedan • Pickup • Van • Coupe • Wagon/Hatch",
+                rows = report.bodyLeaderboard,
+                barColor = MaterialTheme.colorScheme.tertiary
+            )
+        }
+
+        if (report.colorLeaderboard.isNotEmpty()) {
+            AnalyticsSectionCard(
+                title = "BY VEHICLE COLOR",
+                subtitle = "Extracted from vehicle crop HSV + voice descriptors",
+                rows = report.colorLeaderboard,
+                barColor = JoltColors.severityOrange
+            )
+        }
+
+        // 6. Top Behavior Triggers
+        if (report.triggerBreakdown.isNotEmpty()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape  = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text       = "MOST COMMON BEHAVIOR TRIGGERS",
+                        color      = Color.White,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize   = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    report.triggerBreakdown.forEach { trig ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Text(
+                                text       = trig.tag.shortHudCode,
+                                color      = severityUiColor(trig.tag.defaultSeverity),
+                                fontWeight = FontWeight.Bold,
+                                fontSize   = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                            Text(
+                                text       = "${trig.count} (${"%.0f".format(trig.sharePct)}%)",
+                                color      = Color.Gray,
+                                fontSize   = 11.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // 7. Repeat Offenders Leaderboard
+        if (report.repeatOffenders.isNotEmpty()) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape  = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(14.dp)) {
+                    Text(
+                        text       = "REPEAT ENCOUNTERS & FREQUENT OFFENDERS",
+                        color      = JoltColors.severityRed,
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize   = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    report.repeatOffenders.forEach { rep ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .background(JoltColors.cardElevated, RoundedCornerShape(6.dp))
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text       = "${rep.plateDisplay}  ${"●".repeat(rep.badIncidentCount.coerceAtMost(5))}",
+                                    color      = severityUiColor(rep.effectiveSeverity),
+                                    fontWeight = FontWeight.ExtraBold,
+                                    fontSize   = 12.sp,
+                                    fontFamily = FontFamily.Monospace
+                                )
+                                Text(
+                                    text  = listOfNotNull(rep.primaryHudBehavior, rep.vehicleMmc).joinToString(" • "),
+                                    color = Color.Gray,
+                                    fontSize = 10.sp
+                                )
+                            }
+                            Text(
+                                text       = "${rep.badIncidentCount} flag / ${rep.sightingCount} seen",
+                                color      = Color.White,
+                                fontSize   = 10.sp,
+                                fontFamily = FontFamily.Monospace
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+    }
+}
+
+@Composable
+private fun MetricMiniCard(label: String, value: String, valueColor: Color, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(8.dp))
+            .padding(vertical = 10.dp, horizontal = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text       = "CAPTURE HISTORY",
-            fontWeight = FontWeight.Bold,
-            fontSize   = 13.sp,
-            color      = Color.Gray,
-            fontFamily = FontFamily.Monospace,
-            modifier   = Modifier.padding(bottom = 12.dp)
+            text       = value,
+            color      = valueColor,
+            fontWeight = FontWeight.ExtraBold,
+            fontSize   = 18.sp,
+            fontFamily = FontFamily.Monospace
         )
-        if (logList.isEmpty()) {
-            EmptyState(
-                icon = Icons.Default.List,
-                text = "No captures yet.\nFlag a bad driver on the Main tab to see records here."
+        Text(
+            text       = label,
+            color      = Color.Gray,
+            fontSize   = 9.sp,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}
+
+@Composable
+private fun AnalyticsSectionCard(
+    title: String,
+    subtitle: String,
+    rows: List<TrendsAnalyticsEngine.CategoryRateRow>,
+    barColor: Color
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape  = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(
+                text       = title,
+                color      = Color.White,
+                fontWeight = FontWeight.ExtraBold,
+                fontSize   = 11.sp,
+                fontFamily = FontFamily.Monospace
             )
-        } else {
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(logList, key = { it.id }) { log -> DriverLogItemWidget(log = log) }
+            Text(text = subtitle, color = Color.Gray, fontSize = 10.sp)
+            Spacer(modifier = Modifier.height(8.dp))
+            rows.forEach { row ->
+                RateBarRow(row = row, accentColor = if (row.isWatchlist) JoltColors.watchlistAccent else barColor)
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun RateBarRow(row: TrendsAnalyticsEngine.CategoryRateRow, accentColor: Color) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text       = row.label,
+                color      = Color.White,
+                fontWeight = FontWeight.SemiBold,
+                fontSize   = 12.sp
+            )
+            Text(
+                text       = "${row.flaggedCount} flag / ${row.observedEncounters} seen (${"%.0f".format(row.ratePct)}%)",
+                color      = Color.Gray,
+                fontSize   = 11.sp,
+                fontFamily = FontFamily.Monospace
+            )
+        }
+        Spacer(modifier = Modifier.height(3.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(JoltColors.barTrack)
+        ) {
+            val fillFrac = (row.ratePct / 100f).coerceIn(0f, 1f)
+            if (fillFrac > 0f) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(fillFrac)
+                        .fillMaxHeight()
+                        .background(accentColor)
+                )
             }
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Export tab
+// Parked Incident Review & Correction Dialog (Requirements §13 Correctability)
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun IncidentReviewEditDialog(
+    log: DriverLog,
+    onDismiss: () -> Unit,
+    onSave: (String, String, String, String, List<BehaviorTag>, JoltSeverity, String) -> Unit,
+    onDelete: () -> Unit
+) {
+    val resolvedApp = remember(log) { PartialMatchEngine.resolveStoredAppearance(listOf(log)) }
+    var plateText by remember(log) { mutableStateOf(log.plateOcr ?: "") }
+    var colorText by remember(log) { mutableStateOf(log.vehicleColor ?: resolvedApp.color ?: "") }
+    var makeText  by remember(log) { mutableStateOf(log.vehicleMake ?: resolvedApp.make ?: "") }
+    var bodyText  by remember(log) { mutableStateOf(log.vehicleBodyStyle ?: resolvedApp.bodyStyle ?: "") }
+    var notesText by remember(log) { mutableStateOf(log.notes ?: "") }
+    var selectedTags by remember(log) { mutableStateOf(BehaviorTag.parseList(log.behaviorTags)) }
+    var selectedSeverity by remember(log) {
+        mutableStateOf(JoltSeverity.fromCode(log.severity) ?: JoltSeverity.ORANGE)
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                text       = if (log.rating == "ANGEL") "Review ★ Angel Record" else "Review / Edit Incident",
+                fontWeight = FontWeight.ExtraBold,
+                fontSize   = 16.sp
+            )
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedTextField(
+                    value = plateText,
+                    onValueChange = { plateText = it.uppercase() },
+                    label = { Text("License Plate") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = colorText,
+                        onValueChange = { colorText = it },
+                        label = { Text("Color") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedTextField(
+                        value = makeText,
+                        onValueChange = { makeText = it },
+                        label = { Text("Make") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    OutlinedTextField(
+                        value = bodyText,
+                        onValueChange = { bodyText = it },
+                        label = { Text("Body (SUV/Sedan/Pickup)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+
+                if (log.rating != "ANGEL") {
+                    Text("Severity:", fontSize = 11.sp, color = Color.Gray, fontFamily = FontFamily.Monospace)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        listOf(JoltSeverity.YELLOW, JoltSeverity.ORANGE, JoltSeverity.RED, JoltSeverity.MAROON).forEach { sev ->
+                            FilterChip(
+                                selected = selectedSeverity == sev,
+                                onClick  = { selectedSeverity = sev },
+                                label    = { Text(sev.displayLabel, fontSize = 10.sp, fontWeight = FontWeight.Bold) }
+                            )
+                        }
+                    }
+
+                    Text("Behavior Tags (up to 2):", fontSize = 11.sp, color = Color.Gray, fontFamily = FontFamily.Monospace)
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        BehaviorTag.entries.forEach { tag ->
+                            val isSel = tag in selectedTags
+                            FilterChip(
+                                selected = isSel,
+                                onClick = {
+                                    selectedTags = if (isSel) {
+                                        selectedTags - tag
+                                    } else {
+                                        (selectedTags + tag).takeLast(BehaviorTag.MAX_TAGS_PER_INCIDENT)
+                                    }
+                                },
+                                label = { Text(tag.shortHudCode, fontSize = 10.sp) }
+                            )
+                        }
+                    }
+                }
+
+                OutlinedTextField(
+                    value = notesText,
+                    onValueChange = { notesText = it },
+                    label = { Text("Distinctive Features / Notes (tint, stickers, racks)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                TextButton(onClick = onDelete) {
+                    Icon(Icons.Default.Delete, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Delete This Record", color = MaterialTheme.colorScheme.primary)
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    onSave(plateText, colorText, makeText, bodyText, selectedTags, selectedSeverity, notesText)
+                }
+            ) {
+                Text("Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Export tab (CSV + Full DB Backup + Trusted-Group Sync + Training + Telemetry)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Composable
 fun ExportScreen(
     logList: List<DriverLog>,
+    trustedUnitId: String,
+    onExportGroupBundle: () -> Unit,
+    onImportGroupBundle: (Uri) -> Unit,
     trainingMode: Boolean,
     trainingCount: Int,
     onToggleTraining: () -> Unit,
@@ -995,6 +1585,11 @@ fun ExportScreen(
     onBackupDatabase: () -> Unit
 ) {
     val context = LocalContext.current
+    val importBundleLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) onImportGroupBundle(uri)
+    }
 
     Column(
         modifier = Modifier
@@ -1005,17 +1600,17 @@ fun ExportScreen(
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Text(
-            text       = "EXPORT DATA",
+            text       = "EXPORT & GROUP SYNC",
             fontWeight = FontWeight.Bold,
             fontSize   = 16.sp,
             color      = Color.Gray,
             fontFamily = FontFamily.Monospace,
-            modifier   = Modifier.padding(bottom = 24.dp)
+            modifier   = Modifier.padding(bottom = 20.dp)
         )
 
         Button(
             onClick  = { exportToCsv(context, logList) },
-            modifier = Modifier.fillMaxWidth().height(54.dp),
+            modifier = Modifier.fillMaxWidth().height(52.dp),
             colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
             shape    = RoundedCornerShape(10.dp)
         ) {
@@ -1024,40 +1619,90 @@ fun ExportScreen(
             Text("Export Records (CSV)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
         }
 
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
-            text     = "${logList.size} flagged capture${if (logList.size != 1) "s" else ""} in database",
+            text     = "${logList.size} record${if (logList.size != 1) "s" else ""} in database",
             color    = Color.Gray,
             fontSize = 12.sp
         )
 
         Spacer(modifier = Modifier.height(Dimens.spaceMd))
 
-        // A21 #4: full backup (DB + evidence crops). CSV above is a readable report; this is the
-        // one that can actually bring the records back after a lost or wiped phone.
         Button(
             onClick  = onBackupDatabase,
             enabled  = logList.isNotEmpty(),
-            modifier = Modifier.fillMaxWidth().height(54.dp),
+            modifier = Modifier.fillMaxWidth().height(52.dp),
             colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
             shape    = RoundedCornerShape(10.dp)
         ) {
             Icon(Icons.Default.Save, contentDescription = null)
             Spacer(modifier = Modifier.width(10.dp))
-            Text("Backup Database (ZIP)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Text("Backup Database + Crops (ZIP)", fontWeight = FontWeight.Bold, fontSize = 14.sp)
         }
-        Spacer(modifier = Modifier.height(Dimens.spaceXs))
-        Text(
-            text     = "Includes plate crop images. Restore is a manual adb step — see " +
-                       "DatabaseBackup.restoreInstructions().",
-            color    = Color.Gray,
-            fontSize = 11.sp,
-            textAlign = TextAlign.Center
-        )
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(Dimens.spaceLg))
 
-        // Training data collection + export card (Phase 6 / A19)
+        // Phase 3 Closed Trusted-Group Share / Import Card (3-4 family/commuter units)
+        Card(
+            colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape    = RoundedCornerShape(10.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(Dimens.spaceLg)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text       = "Trusted-Group Share",
+                        fontWeight = FontWeight.SemiBold,
+                        color      = Color.White,
+                        fontSize   = 14.sp
+                    )
+                    Text(
+                        text       = trustedUnitId,
+                        color      = JoltColors.peerBadge,
+                        fontWeight = FontWeight.Bold,
+                        fontSize   = 11.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+                Spacer(modifier = Modifier.height(Dimens.spaceXs))
+                Text(
+                    text     = "Share vehicle warnings with 3–4 family or coworker phones. " +
+                               "GPS coordinates are stripped automatically for privacy.",
+                    color    = Color.Gray,
+                    fontSize = 11.sp
+                )
+                Spacer(modifier = Modifier.height(Dimens.spaceMd))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(Dimens.spaceSm)
+                ) {
+                    Button(
+                        onClick  = onExportGroupBundle,
+                        enabled  = logList.isNotEmpty(),
+                        modifier = Modifier.weight(1f).height(46.dp),
+                        colors   = ButtonDefaults.buttonColors(containerColor = JoltColors.actionBlue),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Share (.json)", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                    OutlinedButton(
+                        onClick  = { importBundleLauncher.launch(arrayOf("application/json", "*/*")) },
+                        modifier = Modifier.weight(1f).height(46.dp),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Import Peer", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(Dimens.spaceLg))
+
+        // Training data collection + export card
         Card(
             colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape    = RoundedCornerShape(10.dp),
@@ -1079,8 +1724,7 @@ fun ExportScreen(
                 }
                 Spacer(modifier = Modifier.height(Dimens.spaceXs))
                 Text(
-                    text     = "When ON, confident plate detections are saved as annotated frames " +
-                               "(YOLO format) for model fine-tuning.",
+                    text     = "Saves annotated YOLO frames asynchronously on background I/O (keep OFF for normal commuting).",
                     color    = Color.Gray,
                     fontSize = 11.sp
                 )
@@ -1121,7 +1765,7 @@ fun ExportScreen(
 
         Spacer(modifier = Modifier.height(Dimens.spaceLg))
 
-        // Field Telemetry & Soak Logger card (Phase 5-7 drive validation without USB adb)
+        // Field Telemetry & Soak Logger card
         Card(
             colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape    = RoundedCornerShape(10.dp),
@@ -1144,7 +1788,7 @@ fun ExportScreen(
                 Spacer(modifier = Modifier.height(Dimens.spaceXs))
                 Text(
                     text     = "Logs frame latency, thermal throttling/headroom, battery °C, " +
-                               "Java/native heap, GPS speed, OCR votes & MMC top-3 scores to disk.",
+                               "Java/native heap, GPS speed, OCR votes & MMC scores to disk.",
                     color    = Color.Gray,
                     fontSize = 11.sp
                 )
@@ -1185,7 +1829,6 @@ fun ExportScreen(
     }
 }
 
-/** Bounded in-memory LRU cache for History plate thumbnails (bytes-sized, ~4 MB). */
 private object PlateThumbnailCache {
     private val cache = object : LruCache<String, Bitmap>(4 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount
@@ -1218,7 +1861,6 @@ private fun decodeSampledThumbnail(path: String, reqWidth: Int = 216, reqHeight:
     }
 }
 
-/** Format a CSV text field per RFC 4180; empty string for null. */
 internal fun csvField(value: String?): String {
     val v = value ?: return ""
     return "\"" + v.replace("\"", "\"\"") + "\""
@@ -1237,6 +1879,7 @@ private fun exportToCsv(context: Context, logs: List<DriverLog>) {
             context.contentResolver.openOutputStream(it)?.use { stream ->
                 stream.write(
                     ("ID,Timestamp,Latitude,Longitude,PlateOCR,PlateNormalized,VehicleMMC," +
+                        "VehicleColor,VehicleMake,VehicleBodyStyle,ReporterId," +
                         "Rating,Severity,BehaviorTags,MatchConfidence,Notes,Battery,PlateCropPath\n").toByteArray()
                 )
                 logs.forEach { log ->
@@ -1248,6 +1891,10 @@ private fun exportToCsv(context: Context, logs: List<DriverLog>) {
                         csvField(log.plateOcr),
                         csvField(log.plateNormalized),
                         csvField(log.vehicleMmc),
+                        csvField(log.vehicleColor),
+                        csvField(log.vehicleMake),
+                        csvField(log.vehicleBodyStyle),
+                        csvField(log.reporterId),
                         log.rating,
                         csvField(log.severity),
                         csvField(log.behaviorTags),
@@ -1283,7 +1930,7 @@ fun ManageScreen(
         AlertDialog(
             onDismissRequest = { showClearDialog = false },
             title            = { Text("Clear All Records?") },
-            text             = { Text("This will permanently delete all ${logList.size} flagged captures.") },
+            text             = { Text("This will permanently delete all ${logList.size} captures and encounter stats.") },
             confirmButton    = {
                 TextButton(onClick = { onClearAll(); showClearDialog = false }) {
                     Text("Delete All", color = MaterialTheme.colorScheme.primary)
@@ -1350,14 +1997,18 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text       = log.plateOcr ?: log.vehicleMmc ?: "Unidentified",
+                    text       = log.plateOcr ?: log.vehicleMmc ?: log.notes ?: "Unidentified",
                     color      = Color.White,
                     fontWeight = FontWeight.Bold,
                     fontSize   = 13.sp,
                     fontFamily = if (log.plateOcr != null) FontFamily.Monospace else FontFamily.Default
                 )
                 Text(
-                    text     = "GPS: [${String.format("%.4f", log.latitude)}, ${String.format("%.4f", log.longitude)}]",
+                    text     = if (log.latitude != 0.0 || log.longitude != 0.0) {
+                        "GPS: [${String.format("%.4f", log.latitude)}, ${String.format("%.4f", log.longitude)}]"
+                    } else {
+                        "Source: ${log.reporterId}"
+                    },
                     color    = Color.Gray,
                     fontSize = 9.sp,
                     fontFamily = FontFamily.Monospace
@@ -1375,7 +2026,6 @@ private fun DriverLogManageItem(log: DriverLog, onDelete: () -> Unit) {
 // Shared UI: empty-state hint + history log item card
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** Consistent full-screen empty state: centered gray icon + one-line hint (monospace). */
 @Composable
 fun EmptyState(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
     Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -1399,7 +2049,7 @@ fun EmptyState(icon: ImageVector, text: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun DriverLogItemWidget(log: DriverLog) {
+fun DriverLogItemWidget(log: DriverLog, onClick: (() -> Unit)? = null) {
     val parsedSeverity = JoltSeverity.fromCode(log.severity)
     val ratingColor = when {
         log.rating == "ANGEL"    -> JoltColors.angelGreen
@@ -1436,22 +2086,34 @@ fun DriverLogItemWidget(log: DriverLog) {
     Card(
         shape    = RoundedCornerShape(8.dp),
         colors   = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
     ) {
         Row(
             modifier              = Modifier.padding(12.dp).fillMaxWidth(),
             verticalAlignment     = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            Text(
-                text       = badgeText,
-                color      = ratingColor,
-                fontWeight = FontWeight.Bold,
-                fontSize   = 10.sp,
-                fontFamily = FontFamily.Monospace,
-                modifier   = Modifier.width(56.dp)
-            )
-            Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
+            Column(modifier = Modifier.width(60.dp)) {
+                Text(
+                    text       = badgeText,
+                    color      = ratingColor,
+                    fontWeight = FontWeight.Bold,
+                    fontSize   = 10.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+                if (log.reporterId != "LOCAL") {
+                    Text(
+                        text       = "PEER",
+                        color      = JoltColors.peerBadge,
+                        fontWeight = FontWeight.Bold,
+                        fontSize   = 9.sp,
+                        fontFamily = FontFamily.Monospace
+                    )
+                }
+            }
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 8.dp)) {
                 if (log.plateOcr != null) {
                     Text(
                         text       = "Plate: ${log.plateOcr}",
@@ -1480,6 +2142,9 @@ fun DriverLogItemWidget(log: DriverLog) {
                 val metaLine = buildString {
                     if (log.plateOcr != null && !log.vehicleMmc.isNullOrBlank()) {
                         append(log.vehicleMmc).append("  •  ")
+                    }
+                    if (!log.notes.isNullOrBlank() && log.plateOcr != null) {
+                        append(log.notes).append("  •  ")
                     }
                     append(formattedDate)
                 }
@@ -1519,8 +2184,6 @@ fun BoundingBoxOverlay(
     val green = JoltColors.bboxGreen
     Canvas(modifier = modifier) {
         if (boxes.isEmpty() || size.width <= 0f || size.height <= 0f) return@Canvas
-        // Match PreviewView's default FILL_CENTER (aspect-fill + center-crop) projection so
-        // green boxes align with the rendered preview instead of stretching across aspect ratios.
         val canvasAspect = size.width / size.height
         val safeFrameAspect = if (frameAspectRatio > 0f) frameAspectRatio else canvasAspect
         val renderW: Float
@@ -1551,7 +2214,7 @@ fun BoundingBoxOverlay(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CameraX preview composable (unchanged logic, package updated)
+// CameraX preview composable (R12 preserved)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @OptIn(ExperimentalCamera2Interop::class)
@@ -1563,24 +2226,13 @@ fun CameraPreviewWidget(
 ) {
     val context = LocalContext.current
 
-    // R12: the ImageAnalysis use case is built here rather than inside the AndroidView factory.
-    // The factory lambda runs exactly ONCE per view instance, so anything captured in it (like the
-    // analyzer reference) is frozen at first composition. On a fresh install the analyzer is still
-    // null at that moment — see MainActivity.telephotoAnalyzer — which used to mean setAnalyzer()
-    // was never called at all and the ML pipeline silently received zero frames for the whole
-    // session. Hoisting the use case lets the effect below (re)attach the analyzer whenever it
-    // changes. Bound once via bindToLifecycle in the factory; setAnalyzer is safe to call later.
     val imageAnalysis = remember {
         ImageAnalysis.Builder()
-            // RGBA_8888 output lets the analyzer build a Bitmap straight from the
-            // single plane buffer — no YUV→NV21→JPEG→RGB round-trip per frame.
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .build()
     }
 
-    // R12: attach/detach reactively. Keyed on `analyzer`, so the null → non-null transition after
-    // the permission grant actually wires the pipeline up.
     DisposableEffect(imageAnalysis, analyzer) {
         if (analyzer != null) {
             imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(context), analyzer)
@@ -1602,9 +2254,6 @@ fun CameraPreviewWidget(
                         setSurfaceProvider(previewView.surfaceProvider)
                     }
 
-                    // MainActivity is locked to portrait in AndroidManifest.xml; keep Preview and
-                    // ImageAnalysis locked to Surface.ROTATION_0 so slight mount tilt never rotates
-                    // frames sideways for YOLO/OCR.
                     preview.targetRotation = android.view.Surface.ROTATION_0
                     imageAnalysis.targetRotation = android.view.Surface.ROTATION_0
 
@@ -1614,7 +2263,6 @@ fun CameraPreviewWidget(
                         val camera = cameraProvider.bindToLifecycle(
                             lifecycleOwner, telephotoSelector, preview, imageAnalysis
                         )
-                        // 5× zoom targets the Pixel 10 telephoto lens
                         camera.cameraControl.setZoomRatio(5.0f)
                         Log.i("CameraPreviewWidget", "Bound to telephoto lens at 5× zoom.")
                     } catch (e: Exception) {
@@ -1642,7 +2290,6 @@ private fun findTelephotoCameraSelector(cameraProvider: ProcessCameraProvider): 
         val lensFacing  = cam2Info.getCameraCharacteristic(CameraCharacteristics.LENS_FACING)
         if (lensFacing == CameraCharacteristics.LENS_FACING_BACK) {
             val focalLengths = cam2Info.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
-            // Pixel 10 telephoto focal length > 7.0mm; wide lens ~6.5mm
             if (focalLengths != null && focalLengths.any { it >= 7.0f }) {
                 return cameraInfo.cameraSelector
             }

@@ -1,6 +1,8 @@
 package com.ct3d.jolt.speech
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import com.ct3d.jolt.data.BehaviorTag
 import com.ct3d.jolt.data.JoltSeverity
@@ -37,38 +39,40 @@ sealed interface VoiceCommand {
     data object UndoOrWrongCar : VoiceCommand
     data object MuteAlerts : VoiceCommand
     data object UnmuteAlerts : VoiceCommand
+    data object RepeatLastAlert : VoiceCommand
 }
 
 /**
  * Pure, deterministic parser for constrained-grammar Vosk transcripts.
  *
- * Supports:
- *  - Standalone wake word ("Jolt" / "Hey Jolt") -> [VoiceCommand.WakeDetected] (opens 8s command window)
- *  - One-shot wake commands ("Jolt flag weaving", "Hey Jolt angel that car")
- *  - Active awake window ([isAwakeForCommand] = true): after saying "Jolt", any action word ("flag",
- *    "weaving", "cutting", "angel", "cancel", etc.) executes immediately without repeating "Jolt"!
- *  - Post-flag follow-up window ([awaitingFollowUpReason] = true): refines the just-created flag.
+ * Phase 2.1 Road-Noise Hardening:
+ *  - Removed single-syllable `"bolt"` / `"volt"` phonetic aliases that occasionally false-woke on
+ *    75 mph wind/road thumps or background lyrics (`raw=[unk] bolt`), keeping `"jolt"`, `"hey jolt"`,
+ *    and `"okay jolt"`.
+ *  - Added `"what was that"` / `"repeat alert"` ([VoiceCommand.RepeatLastAlert]).
  */
 object VoiceCommandParser {
 
-    // Phonetic aliases ("bolt", "volt") catch noisy-cabin consonant shifts on "jolt".
-    private val wakeTokens = setOf("jolt", "bolt", "volt")
+    private val wakeTokens = setOf("jolt")
 
     private val descriptorVocabulary = listOf(
-        "white", "black", "silver", "gray", "red", "blue", "green",
-        "suv", "sedan", "truck", "van", "coupe",
-        "honda", "acura", "infiniti", "toyota", "ford", "subaru", "bmw", "tesla", "nissan", "chevy", "jeep"
+        "white", "black", "silver", "gray", "red", "blue", "green", "tan", "gold",
+        "suv", "sedan", "truck", "pickup", "van", "coupe", "wagon", "hatchback",
+        "honda", "acura", "infiniti", "toyota", "ford", "subaru", "bmw", "tesla",
+        "nissan", "chevy", "chevrolet", "jeep", "audi", "mercedes", "hyundai", "kia",
+        "mazda", "volkswagen", "volvo", "lexus", "dodge", "gmc", "cadillac"
     )
 
     fun buildGrammarJson(): String {
         val phrases = linkedSetOf<String>()
         phrases.addAll(
             listOf(
-                "jolt", "hey jolt", "okay jolt", "hey bolt", "hey volt",
+                "jolt", "hey jolt", "okay jolt",
                 "flag", "flag that", "flag car", "mark", "angel", "angel car",
                 "that", "the", "car", "vehicle", "ahead", "in front", "on left", "on right", "for", "and",
                 "wrong car", "cancel", "undo", "delete", "remove", "remove last",
                 "mute", "mute alerts", "sound on", "alerts on",
+                "what was that", "repeat alert",
                 "yellow", "orange", "red", "maroon"
             )
         )
@@ -128,6 +132,9 @@ object VoiceCommandParser {
         }
 
         if (hasWakeWord || isAwakeForCommand) {
+            if (cleaned.contains("what was that") || cleaned.contains("repeat alert")) {
+                return VoiceCommand.RepeatLastAlert
+            }
             if (cleaned.contains("alerts on") || cleaned.contains("sound on")) {
                 return VoiceCommand.UnmuteAlerts
             }
@@ -232,8 +239,12 @@ class VoskVoiceController(
     }
 
     private val appContext = context.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var model: Model? = null
     private var speechService: SpeechService? = null
+
+    /** Invoked whenever an active voice-command or follow-up listening window opens or expires. */
+    var onActiveListeningWindowChanged: ((Boolean) -> Unit)? = null
 
     private val _state = MutableStateFlow(State.INITIALIZING)
     val state: StateFlow<State> = _state
@@ -253,8 +264,13 @@ class VoskVoiceController(
     @Volatile
     private var awaitingReasonUntilMs: Long = 0L
 
+    private var lastPublishedActiveWindow = false
     private var lastDispatchedText = ""
     private var lastDispatchedAtMs = 0L
+
+    private val windowExpiryRunnable = Runnable {
+        updatePublishedState()
+    }
 
     fun initialize() {
         if (model != null) {
@@ -293,8 +309,9 @@ class VoskVoiceController(
     }
 
     /** Opens an 8-second awake command window after hearing "Jolt" so any action word fires immediately. */
-    fun openAwakeCommandWindow(durationMs: Long = 8_500L) {
+    fun openAwakeCommandWindow(durationMs: Long = 8_000L) {
         awakeUntilMs = System.currentTimeMillis() + durationMs
+        scheduleWindowExpiryCheck(durationMs)
         updatePublishedState()
     }
 
@@ -306,9 +323,10 @@ class VoskVoiceController(
     fun isAwakeForCommand(): Boolean = System.currentTimeMillis() < awakeUntilMs
 
     /** Opens a 7-second follow-up window after "Jolt, flag that car" so user can state the reason. */
-    fun openFollowUpReasonWindow(durationMs: Long = 7_500L) {
+    fun openFollowUpReasonWindow(durationMs: Long = 7_000L) {
         awaitingReasonUntilMs = System.currentTimeMillis() + durationMs
         awakeUntilMs = 0L
+        scheduleWindowExpiryCheck(durationMs)
         updatePublishedState()
     }
 
@@ -320,14 +338,27 @@ class VoskVoiceController(
 
     fun isAwaitingFollowUpReason(): Boolean = System.currentTimeMillis() < awaitingReasonUntilMs
 
+    private fun scheduleWindowExpiryCheck(durationMs: Long) {
+        mainHandler.removeCallbacks(windowExpiryRunnable)
+        mainHandler.postDelayed(windowExpiryRunnable, durationMs + 60L)
+    }
+
     fun toggleUserMute(): Boolean {
         userMuted = !userMuted
+        if (userMuted) {
+            awakeUntilMs = 0L
+            awaitingReasonUntilMs = 0L
+        }
         syncPauseState()
         return userMuted
     }
 
     fun setTabActive(active: Boolean) {
         tabActive = active
+        if (!active) {
+            awakeUntilMs = 0L
+            awaitingReasonUntilMs = 0L
+        }
         syncPauseState()
     }
 
@@ -349,10 +380,17 @@ class VoskVoiceController(
 
     private fun updatePublishedState() {
         if (model == null || speechService == null) return
+        val awaiting = !userMuted && tabActive && isAwaitingFollowUpReason()
+        val awake = !userMuted && tabActive && isAwakeForCommand()
+        val activeWindowNow = awaiting || awake
+        if (activeWindowNow != lastPublishedActiveWindow) {
+            lastPublishedActiveWindow = activeWindowNow
+            onActiveListeningWindowChanged?.invoke(activeWindowNow)
+        }
         _state.value = when {
             userMuted -> State.MUTED_BY_USER
-            isAwaitingFollowUpReason() -> State.AWAITING_REASON
-            isAwakeForCommand() -> State.AWAKE_COMMAND
+            awaiting -> State.AWAITING_REASON
+            awake -> State.AWAKE_COMMAND
             else -> State.LISTENING
         }
     }
@@ -361,7 +399,7 @@ class VoskVoiceController(
         if (ttsSpeaking || userMuted || !tabActive) return
         val partial = VoiceCommandParser.extractTextFromVoskJson(hypothesis)
         if (partial.isNotEmpty() && VoiceCommandParser.containsWakeToken(partial)) {
-            // Immediately light up the awake state as soon as "Jolt" is heard mid-sentence!
+            // Immediately light up the awake state & pause Spotify as soon as "Jolt" is heard!
             if (!isAwakeForCommand() && !isAwaitingFollowUpReason()) {
                 openAwakeCommandWindow()
             }
@@ -424,6 +462,7 @@ class VoskVoiceController(
     }
 
     fun release() {
+        mainHandler.removeCallbacksAndMessages(null)
         try {
             speechService?.stop()
             speechService?.shutdown()

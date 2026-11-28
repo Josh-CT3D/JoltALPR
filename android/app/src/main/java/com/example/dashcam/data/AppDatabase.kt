@@ -9,12 +9,16 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 /**
- * Singleton database wrapper over SQLite.
+ * Singleton database wrapper over SQLite (version 7).
  *
  * Migrations are explicit (no destructive fallback) so Jack's flagged-driver records survive
- * schema bumps. Each version bump adds a Migration(n, n+1); see MIGRATION_4_5.
+ * every schema upgrade across versions 4 -> 5 -> 6 -> 7.
  */
-@Database(entities = [DriverLog::class, LocationRecord::class], version = 6, exportSchema = false)
+@Database(
+    entities = [DriverLog::class, LocationRecord::class, AppearanceEncounter::class],
+    version = 7,
+    exportSchema = false
+)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun driverLogDao(): DriverLogDao
 
@@ -47,8 +51,6 @@ abstract class AppDatabase : RoomDatabase() {
 
         /**
          * v5 -> v6 (Phase 2): add behaviorTags, severity, matchConfidence, and notes to driver_logs.
-         * Preserves all existing BAD / SIGHTING rows; existing BAD rows default to ORANGE severity
-         * and confirmed matchConfidence = 1.0, while legacy GOOD rows map to ANGEL.
          */
         val MIGRATION_5_6 = object : Migration(5, 6) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -61,6 +63,28 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * v6 -> v7 (Phase 3): add structured vehicle appearance columns (`vehicleColor`,
+         * `vehicleMake`, `vehicleBodyStyle`), `reporterId` for closed Trusted-Group sharing,
+         * and the `appearance_encounters` table for normalized incident-rate analytics.
+         */
+        val MIGRATION_6_7 = object : Migration(6, 7) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `vehicleColor` TEXT")
+                db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `vehicleMake` TEXT")
+                db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `vehicleBodyStyle` TEXT")
+                db.execSQL("ALTER TABLE `driver_logs` ADD COLUMN `reporterId` TEXT NOT NULL DEFAULT 'LOCAL'")
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `appearance_encounters` (" +
+                        "`categoryType` TEXT NOT NULL, " +
+                        "`categoryKey` TEXT NOT NULL, " +
+                        "`encounterCount` INTEGER NOT NULL, " +
+                        "`lastSeenTimestamp` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`categoryType`, `categoryKey`))"
+                )
+            }
+        }
+
         fun getDatabase(context: Context): AppDatabase {
             return INSTANCE ?: synchronized(this) {
                 try {
@@ -69,8 +93,8 @@ abstract class AppDatabase : RoomDatabase() {
                         AppDatabase::class.java,
                         "driver_behavior_dashcam_db"
                     )
-                    .addMigrations(MIGRATION_4_5, MIGRATION_5_6)
-                    .build()
+                        .addMigrations(MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7)
+                        .build()
                     INSTANCE = instance
                     Log.i("AppDatabase", "AppDatabase singleton instance created successfully.")
                     instance

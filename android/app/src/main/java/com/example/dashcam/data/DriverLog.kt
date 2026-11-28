@@ -5,12 +5,9 @@ import androidx.room.Index
 import androidx.room.PrimaryKey
 
 /**
- * Room Database entity representing a recorded driver event.
- * Contains GPS coords, timestamp, rating (Good/Bad), and the identified
- * vehicle indicators (ALPR Text or Make, Model, Color).
+ * Room Database entity (v7) representing a recorded vehicle incident, Angel mark, or sighting.
  *
- * Indexed on (plateNormalized, rating) because findBadDriverByPlate() runs on every OCR read
- * (>=2/sec after A5) and filters on exactly those columns — the index avoids a full table scan.
+ * Indexed on (plateNormalized, rating) because reputation lookups run on every OCR read.
  */
 @Entity(
     tableName = "driver_logs",
@@ -22,23 +19,25 @@ data class DriverLog(
     val rating: String, // "BAD", "ANGEL", or "SIGHTING"
     val plateOcr: String?, // Raw resolved plate string, shown in the UI verbatim
     val plateNormalized: String? = null, // OCR-confusion-folded form used for matching (A16)
-    val vehicleMmc: String?, // Make/Model class (retained alongside plateOcr in v6+)
+    val vehicleMmc: String?, // Clean vehicle summary (e.g. "White Honda SUV")
     val timestamp: Long, // Epoch millis
-    val latitude: Double, // Device GPS coordinates
+    val latitude: Double, // Device GPS coordinates (0.0 for privacy-stripped peer imports)
     val longitude: Double,
-    val batteryLevel: Int = 100, // System battery level percentage (default 100)
+    val batteryLevel: Int = 100,
     val plateCropPath: String? = null, // Absolute path to JPEG crop saved in filesDir/crops/
-    val behaviorTags: String? = null, // Up to 2 comma-separated BehaviorTag names (e.g. "CUTTING,ASSHOLE")
+    val behaviorTags: String? = null, // Up to 2 comma-separated BehaviorTag names
     val severity: String? = null, // "YELLOW", "ORANGE", "RED", "MAROON", or "ANGEL"
-    val matchConfidence: Float = 1.0f, // 1.0 = confirmed plate, <1.0 = partial/suspected match
-    val notes: String? = null // Optional voice descriptor (e.g. "white suv")
+    val matchConfidence: Float = 1.0f, // 1.0 = confirmed plate, <1.0 = partial/advisory match
+    val notes: String? = null, // Optional spoken/edited vehicle descriptor or feature note
+    val vehicleColor: String? = null, // Phase 3 structured color (e.g. "White")
+    val vehicleMake: String? = null, // Phase 3 structured make (e.g. "Honda")
+    val vehicleBodyStyle: String? = null, // Phase 3 structured body style (e.g. "SUV")
+    val reporterId: String = "LOCAL" // "LOCAL" or "Peer:<unit>" for Trusted-Group shared records
 )
 
 /**
  * Normalize a plate string for confusion-tolerant matching: uppercase, strip non-alphanumerics,
- * then fold the common OCR confusions to a canonical digit (O->0, I->1, B->8, S->5). Store this
- * alongside the raw OCR and match known-bad lookups on it so e.g. a stored "AB0123" still alerts
- * on a read of "ABO123". The UI keeps showing the raw [DriverLog.plateOcr].
+ * then fold the common OCR confusions to a canonical digit (O->0, I->1, B->8, S->5).
  */
 fun normalizePlate(raw: String): String =
     raw.uppercase()

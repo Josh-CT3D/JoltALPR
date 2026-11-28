@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.RectF
 import android.location.Location
+import android.net.Uri
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -19,8 +20,14 @@ import com.ct3d.jolt.data.DatabaseBackup
 import com.ct3d.jolt.data.DriverLog
 import com.ct3d.jolt.data.JoltSeverity
 import com.ct3d.jolt.data.LocationRecord
+import com.ct3d.jolt.data.PartialMatchEngine
+import com.ct3d.jolt.data.StructuredAppearance
+import com.ct3d.jolt.data.TrendsAnalyticsEngine
+import com.ct3d.jolt.data.TrustedGroupSync
+import com.ct3d.jolt.data.VehicleAppearance
 import com.ct3d.jolt.data.VehicleReputation
 import com.ct3d.jolt.data.computeVehicleReputation
+import com.ct3d.jolt.data.incrementEncounter
 import com.ct3d.jolt.data.normalizePlate
 import com.ct3d.jolt.data.safeClearAllLocationRecords
 import com.ct3d.jolt.data.safeClearAllLogs
@@ -46,6 +53,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -57,7 +66,8 @@ import kotlin.coroutines.resume
 
 /**
  * MVVM ViewModel — manages ALPR detections, multi-incident Vehicle Reputation alerts,
- * Vosk hands-free wake-phrase commands, TTS spoken alerts, Room v6 persistence, GPS, and telemetry.
+ * Tier 2/3 Partial-Plate & Appearance matching, 5s Forward Plate Backfill, Spotify Audio Focus
+ * coordination, Room v7 persistence, Trends Analytics, Parked Review editing, and Trusted-Group Sync.
  */
 class DashcamViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -66,8 +76,11 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val batteryMonitor = BatteryMonitor(application)
     private val trainingCollector = TrainingDataCollector(application)
     private val databaseBackup = DatabaseBackup(application)
+    private val trustedGroupSync = TrustedGroupSync(application)
     private val feedback = FeedbackController(application)
     private val telemetryLogger = FieldTelemetryLogger(application, batteryMonitor)
+
+    val trustedUnitId: String = trustedGroupSync.getOrCreateUnitId()
 
     private val voiceController = VoskVoiceController(application) { command, rawTranscript ->
         viewModelScope.launch {
@@ -81,11 +94,34 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private var lastSightingPlate: String? = null
     private var lastSightingTime: Long = 0L
 
-    // Room Flows — all flagged capture records
+    // Debounce passive encounter denominator counting (20s per Make+Body vehicle pass)
+    private var lastCountedAppearanceKey: String? = null
+    private var lastCountedAppearanceAtMs: Long = 0L
+
+    // Throttle Tier 2/3 SQLite partial-match queries when no exact plate consensus is active
+    private var lastPartialLookupAtMs: Long = 0L
+
+    // Phase 2.1 Forward Plate Backfill: attaches consensus plate locked 1–5.5s after an early highway voice flag
+    private data class PendingPlateBackfill(val rowId: Long, val createdAtMs: Long)
+    @Volatile
+    private var pendingPlateBackfill: PendingPlateBackfill? = null
+
     val logsList: StateFlow<List<DriverLog>> = dao.getAllLogs()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
 
-    // GPS breadcrumb history
+    val trendsReport: StateFlow<TrendsAnalyticsEngine.TrendsReport> = combine(
+        dao.getAllLogs(),
+        dao.getAllAppearanceEncounters()
+    ) { logs, encounters ->
+        TrendsAnalyticsEngine.buildReport(logs, encounters)
+    }
+        .flowOn(Dispatchers.Default)
+        .stateIn(
+            viewModelScope,
+            SharingStarted.WhileSubscribed(5000L),
+            TrendsAnalyticsEngine.buildReport(emptyList(), emptyList())
+        )
+
     val locationHistoryList: StateFlow<List<LocationRecord>> = dao.getAllLocationRecords()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000L), emptyList())
 
@@ -95,7 +131,6 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val _currentLocation = MutableStateFlow<Location?>(null)
     val currentLocation: StateFlow<Location?> = _currentLocation
 
-    // Active ALPR pipeline results from TelephotoAnalyzer
     private val _activePlateOcr = MutableStateFlow<String?>(null)
     val activePlateOcr: StateFlow<String?> = _activePlateOcr
 
@@ -108,12 +143,13 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val _frameAspectRatio = MutableStateFlow(0.75f)
     val frameAspectRatio: StateFlow<Float> = _frameAspectRatio
 
-    // Sticky OCR (5s) + Sticky MMC (10s) so a flagged vehicle retains both plate AND Make/Model.
+    // Sticky OCR (5s) + Sticky MMC/Appearance (10s) so a flagged vehicle retains both plate AND appearance.
     private val _lastConfidentOcr = MutableStateFlow<String?>(null)
     val lastConfidentOcr: StateFlow<String?> = _lastConfidentOcr
     private var ocrStickyJob: Job? = null
 
     private var lastSeenMmc: String? = null
+    private var lastSeenAppearance: StructuredAppearance? = null
     private var mmcStickyJob: Job? = null
 
     // R4: ViewModel owns published plate crops on Main, expiring 5s after plates leave frame.
@@ -125,7 +161,6 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private val _notificationMessage = MutableStateFlow<String?>(null)
     val notificationMessage: StateFlow<String?> = _notificationMessage
 
-    // Active quick-tag refinement state (shows 8 behavior chips for 7s after tapping FLAG)
     data class RecentFlagState(
         val rowId: Long,
         val vehicleLabel: String,
@@ -135,14 +170,12 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     val recentFlagState: StateFlow<RecentFlagState?> = _recentFlagState
     private var recentFlagExpiryJob: Job? = null
 
-    // Training mode (Phase 6)
     private val _trainingModeEnabled = MutableStateFlow(false)
     val trainingModeEnabled: StateFlow<Boolean> = _trainingModeEnabled
 
     private val _trainingSampleCount = MutableStateFlow(0)
     val trainingSampleCount: StateFlow<Int> = _trainingSampleCount
 
-    // Field Telemetry & Soak Logger
     private val _telemetryEnabled = MutableStateFlow(telemetryLogger.isPersistedEnabled())
     val telemetryEnabled: StateFlow<Boolean> = _telemetryEnabled
 
@@ -150,10 +183,6 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     val telemetryEventCount: StateFlow<Int> = _telemetryEventCount
     private var healthTelemetryJob: Job? = null
 
-    /**
-     * Phase 2 Tactical Encounter Alert.
-     * Non-null when a recognized plate has prior BAD or ANGEL history in Room DB.
-     */
     private val _knownBadDriverAlert = MutableStateFlow<VehicleReputation?>(null)
     val knownBadDriverAlert: StateFlow<VehicleReputation?> = _knownBadDriverAlert
 
@@ -183,19 +212,51 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     }
 
     init {
-        Log.i(TAG, "ViewModel initializing — starting GPS, TTS echo guard & telemetry.")
+        Log.i(TAG, "ViewModel initializing — starting GPS, Audio Focus, TTS echo guard & telemetry.")
         feedback.onSpeechStateChanged = { speaking ->
             voiceController.setTtsSpeaking(speaking)
+        }
+        voiceController.onActiveListeningWindowChanged = { activeWindow ->
+            feedback.setVoiceCommandListeningFocus(activeWindow)
         }
         fetchUpdatedLocation()
         startLocationUpdates()
         trimOldBreadcrumbs()
         initializeVoiceIfPermitted()
-        viewModelScope.launch {
-            _trainingSampleCount.value = withContext(Dispatchers.IO) { trainingCollector.sampleCount() }
+        viewModelScope.launch(Dispatchers.IO) {
+            _trainingSampleCount.value = trainingCollector.sampleCount()
+            backfillLegacyStructuredAppearance()
         }
         if (_telemetryEnabled.value) {
             startHealthTelemetryLoop(marker = "APP_RESUME_LOGGING")
+        }
+    }
+
+    /**
+     * Populates `vehicleColor`, `vehicleMake`, `vehicleBodyStyle` on pre-v7 records from their
+     * existing `vehicleMmc` / `notes` text so Trends Analytics immediately reflects prior drives.
+     */
+    private suspend fun backfillLegacyStructuredAppearance() {
+        try {
+            val rows = dao.getAllLogsSnapshot()
+            for (row in rows) {
+                if (row.vehicleColor == null && row.vehicleMake == null && row.vehicleBodyStyle == null &&
+                    (!row.vehicleMmc.isNullOrBlank() || !row.notes.isNullOrBlank())
+                ) {
+                    val parsed = VehicleAppearance.extractFromFreeText(row.vehicleMmc, row.notes)
+                    if (!parsed.isEmpty) {
+                        dao.updateStructuredAppearance(
+                            id = row.id,
+                            color = parsed.color,
+                            make = parsed.make,
+                            bodyStyle = parsed.bodyStyle,
+                            cleanSummary = parsed.formatSummary() ?: row.vehicleMmc
+                        )
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Legacy appearance backfill skipped: ${e.localizedMessage}")
         }
     }
 
@@ -269,6 +330,10 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                 feedback.unmuteAlerts()
                 _notificationMessage.value = "Audio alerts unmuted."
             }
+            VoiceCommand.RepeatLastAlert -> {
+                voiceController.closeFollowUpReasonWindow()
+                feedback.repeatLastAlert()
+            }
         }
     }
 
@@ -308,7 +373,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         plateCrop: Bitmap? = null,
         confirmedPlates: List<String> = listOfNotNull(plateOcr),
         frameWidth: Int = 0,
-        frameHeight: Int = 0
+        frameHeight: Int = 0,
+        activeAppearance: StructuredAppearance? = null,
+        partialPlateHint: String? = null
     ) {
         _activePlateOcr.value = plateOcr
         _activeVehicleMmc.value = vehicleMmc
@@ -317,12 +384,29 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
             _frameAspectRatio.value = frameWidth.toFloat() / frameHeight.toFloat()
         }
 
-        if (vehicleMmc != null) {
-            lastSeenMmc = vehicleMmc
+        // Merge incoming appearance with sticky Make/Body (e.g. when OCR frame provides fresh color)
+        if (activeAppearance != null && !activeAppearance.isEmpty) {
+            val prev = lastSeenAppearance
+            val merged = StructuredAppearance(
+                color = activeAppearance.color ?: prev?.color,
+                make = activeAppearance.make ?: prev?.make,
+                bodyStyle = activeAppearance.bodyStyle ?: prev?.bodyStyle,
+                rawTrimHint = activeAppearance.rawTrimHint ?: prev?.rawTrimHint,
+                makeConfidence = maxOf(activeAppearance.makeConfidence, prev?.makeConfidence ?: 0f),
+                bodyConfidence = maxOf(activeAppearance.bodyConfidence, prev?.bodyConfidence ?: 0f),
+                colorConfidence = maxOf(activeAppearance.colorConfidence, prev?.colorConfidence ?: 0f)
+            )
+            lastSeenAppearance = merged
+            recordPassiveEncounterDenominator(merged, plateBoxes.isNotEmpty())
+        }
+
+        if (vehicleMmc != null || (activeAppearance != null && !activeAppearance.isEmpty)) {
+            if (vehicleMmc != null) lastSeenMmc = vehicleMmc
             mmcStickyJob?.cancel()
             mmcStickyJob = viewModelScope.launch {
                 delay(10_000L)
                 lastSeenMmc = null
+                lastSeenAppearance = null
             }
         }
 
@@ -354,39 +438,155 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                 dismissedAlertPlateNormalized = null
             }
 
+            // Phase 2.1: Check if an early highway voice flag is waiting for forward plate backfill
+            maybeBackfillRecentFlagWithPlate(primary)
+
             viewModelScope.launch {
                 try {
-                    val reputation = lookupPlates.firstNotNullOfOrNull { token ->
+                    val exactReputation = lookupPlates.firstNotNullOfOrNull { token ->
                         val history = dao.findVehicleHistoryByPlate(normalizePlate(token))
                         computeVehicleReputation(history, matchConfidence = 1.0f)
                     }
-                    if (reputation != null) {
-                        if (reputation.plateNormalized != dismissedAlertPlateNormalized) {
-                            _knownBadDriverAlert.value = reputation
+                    if (exactReputation != null) {
+                        dispatchEncounterAlert(exactReputation)
+                    } else {
+                        // Tier 2A: check 1-edit-distance near-miss plate match against known bad drivers
+                        val suspected = withContext(Dispatchers.IO) {
+                            PartialMatchEngine.findBestSuspectedMatch(
+                                candidatePlateOrFragment = primary,
+                                liveAppearance = lastSeenAppearance,
+                                incidentRows = dao.getAllIncidentCandidates()
+                            )
                         }
-                        val now = System.currentTimeMillis()
-                        val newEncounter = reputation.plateNormalized != lastSightingPlate ||
-                            now - lastSightingTime > SIGHTING_COOLDOWN_MS
-                        if (newEncounter) {
-                            lastSightingPlate = reputation.plateNormalized
-                            lastSightingTime = now
-                            feedback.announceEncounter(reputation)
-                            if (reputation.badIncidentCount > 0) {
-                                insertSighting(reputation, now)
-                            }
-                            if (_telemetryEnabled.value) {
-                                telemetryLogger.recordAction(
-                                    "ENCOUNTER_ALERT",
-                                    "plate=${reputation.plateDisplay} sev=${reputation.effectiveSeverity.name} bad=${reputation.badIncidentCount} angel=${reputation.angelCount}",
-                                    currentSpeedMph()
-                                )
-                                _telemetryEventCount.value = telemetryLogger.currentEventCount()
-                            }
+                        if (suspected != null) {
+                            dispatchEncounterAlert(suspected)
                         }
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Vehicle reputation lookup failed: ${e.localizedMessage}", e)
                 }
+            }
+        } else if (partialPlateHint != null || (plateBoxes.isNotEmpty() && lastSeenAppearance != null)) {
+            // Tier 2B / Tier 3: partial plate fragment or obscured-plate full appearance match
+            val now = System.currentTimeMillis()
+            if (now - lastPartialLookupAtMs >= PARTIAL_MATCH_THROTTLE_MS) {
+                lastPartialLookupAtMs = now
+                val liveApp = lastSeenAppearance
+                viewModelScope.launch {
+                    try {
+                        val suspected = withContext(Dispatchers.IO) {
+                            PartialMatchEngine.findBestSuspectedMatch(
+                                candidatePlateOrFragment = partialPlateHint,
+                                liveAppearance = liveApp,
+                                incidentRows = dao.getAllIncidentCandidates()
+                            )
+                        }
+                        if (suspected != null) {
+                            dispatchEncounterAlert(suspected)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Partial match lookup failed: ${e.localizedMessage}")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun maybeBackfillRecentFlagWithPlate(confirmedPlate: String) {
+        val pending = pendingPlateBackfill ?: return
+        val now = System.currentTimeMillis()
+        if (now - pending.createdAtMs > FORWARD_BACKFILL_WINDOW_MS) {
+            pendingPlateBackfill = null
+            return
+        }
+        pendingPlateBackfill = null
+
+        val cropCopy: Bitmap? = _lastPlateCrop.value?.takeIf { !it.isRecycled }?.let { src ->
+            try { src.copy(src.config ?: Bitmap.Config.ARGB_8888, false) } catch (_: Exception) { null }
+        }
+
+        viewModelScope.launch {
+            val savedCropPath = withContext(Dispatchers.IO) {
+                cropCopy?.let { bmp ->
+                    try {
+                        val cropsDir = File(getApplication<Application>().filesDir, "crops").also { it.mkdirs() }
+                        val cropFile = File(cropsDir, "${System.currentTimeMillis()}.jpg")
+                        cropFile.outputStream().use { out -> bmp.compress(Bitmap.CompressFormat.JPEG, 90, out) }
+                        cropFile.absolutePath
+                    } catch (_: Exception) {
+                        null
+                    } finally {
+                        if (!bmp.isRecycled) bmp.recycle()
+                    }
+                }
+            }
+            dao.backfillPlateOnRecentFlag(
+                id = pending.rowId,
+                plateOcr = confirmedPlate,
+                plateNormalized = normalizePlate(confirmedPlate),
+                plateCropPath = savedCropPath,
+                matchConfidence = 1.0f
+            )
+            _recentFlagState.value?.let { rf ->
+                if (rf.rowId == pending.rowId) {
+                    _recentFlagState.value = rf.copy(vehicleLabel = confirmedPlate)
+                }
+            }
+            _notificationMessage.value = "✓ Plate locked & attached to flag: $confirmedPlate"
+            Log.i(TAG, "Forward-backfilled plate '$confirmedPlate' onto recent flag #${pending.rowId}")
+            if (_telemetryEnabled.value) {
+                telemetryLogger.recordAction(
+                    "FORWARD_PLATE_BACKFILL",
+                    "rowId=${pending.rowId} plate=$confirmedPlate",
+                    currentSpeedMph()
+                )
+                _telemetryEventCount.value = telemetryLogger.currentEventCount()
+            }
+        }
+    }
+
+    private fun recordPassiveEncounterDenominator(app: StructuredAppearance, hasPlateBox: Boolean) {
+        // Only count passive road encounters when a vehicle plate box is actually detected in frame
+        if (!hasPlateBox) return
+        val signature = "${app.color ?: "-"}|${app.make ?: "-"}|${app.bodyStyle ?: "-"}"
+        val now = System.currentTimeMillis()
+        if (signature == lastCountedAppearanceKey && now - lastCountedAppearanceAtMs < ENCOUNTER_DENOM_COOLDOWN_MS) {
+            return
+        }
+        lastCountedAppearanceKey = signature
+        lastCountedAppearanceAtMs = now
+
+        viewModelScope.launch(Dispatchers.IO) {
+            app.make?.let { dao.incrementEncounter("MAKE", it, now) }
+            app.bodyStyle?.let { dao.incrementEncounter("BODY", it, now) }
+            app.color?.let { dao.incrementEncounter("COLOR", it, now) }
+            if (app.color.equals("White", ignoreCase = true) && app.bodyStyle.equals("SUV", ignoreCase = true)) {
+                dao.incrementEncounter("COLOR_BODY", "White SUV", now)
+            }
+        }
+    }
+
+    private suspend fun dispatchEncounterAlert(reputation: VehicleReputation) {
+        if (reputation.plateNormalized != dismissedAlertPlateNormalized) {
+            _knownBadDriverAlert.value = reputation
+        }
+        val now = System.currentTimeMillis()
+        val newEncounter = reputation.plateNormalized != lastSightingPlate ||
+            now - lastSightingTime > SIGHTING_COOLDOWN_MS
+        if (newEncounter) {
+            lastSightingPlate = reputation.plateNormalized
+            lastSightingTime = now
+            feedback.announceEncounter(reputation)
+            if (reputation.badIncidentCount > 0 && reputation.matchConfidence >= 0.90f) {
+                insertSighting(reputation, now)
+            }
+            if (_telemetryEnabled.value) {
+                telemetryLogger.recordAction(
+                    "ENCOUNTER_ALERT",
+                    "plate=${reputation.plateDisplay} sev=${reputation.effectiveSeverity.name} conf=${"%.2f".format(reputation.matchConfidence)} bad=${reputation.badIncidentCount} angel=${reputation.angelCount}",
+                    currentSpeedMph()
+                )
+                _telemetryEventCount.value = telemetryLogger.currentEventCount()
             }
         }
     }
@@ -394,6 +594,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     private suspend fun insertSighting(reputation: VehicleReputation, timestamp: Long) {
         try {
             val loc = _currentLocation.value
+            val app = lastSeenAppearance
             dao.safeInsertLog(
                 DriverLog(
                     id = 0,
@@ -406,7 +607,10 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     longitude = loc?.longitude ?: 0.0,
                     batteryLevel = batteryMonitor.getBatteryLevel(),
                     plateCropPath = null,
-                    severity = reputation.effectiveSeverity.name
+                    severity = reputation.effectiveSeverity.name,
+                    vehicleColor = app?.color,
+                    vehicleMake = app?.make,
+                    vehicleBodyStyle = app?.bodyStyle
                 )
             )
             Log.i(TAG, "Auto-logged sighting of known plate ${reputation.plateDisplay}")
@@ -421,9 +625,16 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         Log.i(TAG, "Encounter alert dismissed.")
     }
 
-    /**
-     * Records a BAD incident via voice command or screen FLAG button.
-     */
+    private fun mergeSpokenAndLiveAppearance(notes: String?, mmcText: String?): StructuredAppearance {
+        val spoken = VehicleAppearance.extractFromFreeText(mmcText, notes)
+        val live = lastSeenAppearance
+        return StructuredAppearance(
+            color = spoken.color ?: live?.color,
+            make = spoken.make ?: live?.make,
+            bodyStyle = spoken.bodyStyle ?: live?.bodyStyle
+        )
+    }
+
     fun flagBadDriver(
         tags: List<BehaviorTag> = emptyList(),
         severityOverride: JoltSeverity? = null,
@@ -432,7 +643,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     ) {
         feedback.flagPressed()
         val ocr = _lastConfidentOcr.value ?: _activePlateOcr.value
-        val mmc = _activeVehicleMmc.value ?: lastSeenMmc
+        val rawMmc = _activeVehicleMmc.value ?: lastSeenMmc
+        val mergedApp = mergeSpokenAndLiveAppearance(notes, rawMmc)
+        val mmcSummary = mergedApp.formatSummary() ?: rawMmc
         val hasPlateContext = ocr != null || _plateBoxes.value.isNotEmpty()
         val cropCopy: Bitmap? = if (hasPlateContext) {
             _lastPlateCrop.value?.takeIf { !it.isRecycled }?.let { src ->
@@ -473,7 +686,7 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     rating = "BAD",
                     plateOcr = ocr,
                     plateNormalized = ocr?.let { normalizePlate(it) },
-                    vehicleMmc = mmc, // Retained even when OCR succeeds!
+                    vehicleMmc = mmcSummary,
                     timestamp = captureTime,
                     latitude = lat,
                     longitude = lon,
@@ -481,23 +694,33 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     plateCropPath = cropPath,
                     behaviorTags = BehaviorTag.serialize(cappedTags),
                     severity = initialSeverity.name,
-                    matchConfidence = if (ocr != null) 1.0f else 0.65f,
-                    notes = notes
+                    matchConfidence = if (ocr != null) 1.0f else 0.70f,
+                    notes = notes,
+                    vehicleColor = mergedApp.color,
+                    vehicleMake = mergedApp.make,
+                    vehicleBodyStyle = mergedApp.bodyStyle,
+                    reporterId = "LOCAL"
                 )
 
                 val rowId = dao.safeInsertLog(newLog)
-                val targetName = ocr ?: mmc ?: notes ?: "Unidentified Vehicle"
+                if (ocr == null) {
+                    // Arm 5.5s forward plate backfill in case we are closing distance on the highway!
+                    pendingPlateBackfill = PendingPlateBackfill(rowId, captureTime)
+                } else {
+                    pendingPlateBackfill = null
+                }
+
+                val targetName = ocr ?: mmcSummary ?: notes ?: "Unidentified Vehicle"
                 val tagSuffix = if (cappedTags.isNotEmpty()) " (${cappedTags.joinToString { it.displayLabel }})" else ""
                 _notificationMessage.value = "Flagged [${initialSeverity.displayLabel}]: $targetName$tagSuffix"
                 Log.i(TAG, "Flagged bad driver [Row: $rowId, Target: $targetName, Sev: $initialSeverity, Tags: $cappedTags]")
 
-                // Open 7-second quick-tag / voice follow-up window
                 openRecentFlagWindow(rowId, targetName, cappedTags)
 
                 if (fromVoice) {
                     val spokenTarget = when {
                         ocr != null -> "Plate ${feedback.formatPlateForSpeech(ocr)}"
-                        mmc != null -> mmc
+                        mmcSummary != null -> mmcSummary
                         notes != null -> notes
                         else -> "vehicle"
                     }
@@ -527,13 +750,12 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /**
-     * Records a permanent positive Angel mark for courteous driving ("Jolt, angel that car" or ★ button).
-     */
     fun flagAngelDriver(notes: String? = null, fromVoice: Boolean = false) {
         feedback.flagPressed()
         val ocr = _lastConfidentOcr.value ?: _activePlateOcr.value
-        val mmc = _activeVehicleMmc.value ?: lastSeenMmc
+        val rawMmc = _activeVehicleMmc.value ?: lastSeenMmc
+        val mergedApp = mergeSpokenAndLiveAppearance(notes, rawMmc)
+        val mmcSummary = mergedApp.formatSummary() ?: rawMmc
         val hasPlateContext = ocr != null || _plateBoxes.value.isNotEmpty()
         val cropCopy: Bitmap? = if (hasPlateContext) {
             _lastPlateCrop.value?.takeIf { !it.isRecycled }?.let { src ->
@@ -566,18 +788,25 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
                     rating = "ANGEL",
                     plateOcr = ocr,
                     plateNormalized = ocr?.let { normalizePlate(it) },
-                    vehicleMmc = mmc,
+                    vehicleMmc = mmcSummary,
                     timestamp = captureTime,
                     latitude = loc?.latitude ?: 0.0,
                     longitude = loc?.longitude ?: 0.0,
                     batteryLevel = batteryMonitor.getBatteryLevel(),
                     plateCropPath = cropPath,
                     severity = JoltSeverity.ANGEL.name,
-                    matchConfidence = if (ocr != null) 1.0f else 0.65f,
-                    notes = notes
+                    matchConfidence = if (ocr != null) 1.0f else 0.70f,
+                    notes = notes,
+                    vehicleColor = mergedApp.color,
+                    vehicleMake = mergedApp.make,
+                    vehicleBodyStyle = mergedApp.bodyStyle,
+                    reporterId = "LOCAL"
                 )
-                dao.safeInsertLog(angelLog)
-                val target = ocr ?: mmc ?: notes ?: "Vehicle"
+                val rowId = dao.safeInsertLog(angelLog)
+                if (ocr == null) {
+                    pendingPlateBackfill = PendingPlateBackfill(rowId, captureTime)
+                }
+                val target = ocr ?: mmcSummary ?: notes ?: "Vehicle"
                 _notificationMessage.value = "★ Angel recorded: $target"
                 if (fromVoice) {
                     val spoken = if (ocr != null) "Plate ${feedback.formatPlateForSpeech(ocr)}" else target
@@ -590,7 +819,69 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /** Toggle or set behavior tags on the just-flagged incident (up to 2 tags). */
+    /** Saves edits made in the Parked Incident Review sheet/dialog. */
+    fun saveIncidentReviewEdits(
+        original: DriverLog,
+        editedPlate: String,
+        editedColor: String,
+        editedMake: String,
+        editedBodyStyle: String,
+        editedTags: List<BehaviorTag>,
+        editedSeverity: JoltSeverity,
+        editedNotes: String
+    ) {
+        viewModelScope.launch {
+            val cleanPlate = editedPlate.trim().uppercase().takeIf { it.isNotEmpty() }
+            val normPlate = cleanPlate?.let { normalizePlate(it) }
+            val cleanColor = editedColor.trim().takeIf { it.isNotEmpty() }
+            val cleanMake = editedMake.trim().takeIf { it.isNotEmpty() }
+            val cleanBody = editedBodyStyle.trim().takeIf { it.isNotEmpty() }
+            val summary = StructuredAppearance(color = cleanColor, make = cleanMake, bodyStyle = cleanBody)
+                .formatSummary() ?: original.vehicleMmc
+            val finalSev = if (original.rating == "ANGEL") JoltSeverity.ANGEL.name else editedSeverity.name
+            val cleanNotes = editedNotes.trim().takeIf { it.isNotEmpty() }
+
+            dao.updateLogFullReview(
+                id = original.id,
+                plateOcr = cleanPlate,
+                plateNormalized = normPlate,
+                vehicleMmc = summary,
+                vehicleColor = cleanColor,
+                vehicleMake = cleanMake,
+                vehicleBodyStyle = cleanBody,
+                behaviorTags = if (original.rating == "ANGEL") null else BehaviorTag.serialize(editedTags),
+                severity = finalSev,
+                notes = cleanNotes
+            )
+            _notificationMessage.value = "Updated record: ${cleanPlate ?: summary ?: "#${original.id}"}"
+        }
+    }
+
+    fun exportTrustedGroupBundle() {
+        viewModelScope.launch {
+            val logs = logsList.value
+            val fileName = withContext(Dispatchers.IO) { trustedGroupSync.exportGroupBundleToDownloads(logs) }
+            _notificationMessage.value = if (fileName != null) {
+                "Group bundle saved (GPS stripped): Downloads/$fileName"
+            } else {
+                "No local BAD/ANGEL records to share yet."
+            }
+        }
+    }
+
+    fun importTrustedGroupBundle(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                val res = withContext(Dispatchers.IO) { trustedGroupSync.importGroupBundleFromUri(uri, dao) }
+                _notificationMessage.value =
+                    "Imported ${res.importedCount} record(s) from ${res.sourceUnit} (${res.skippedDuplicates} duplicate skipped)."
+            } catch (e: Exception) {
+                Log.e(TAG, "Group bundle import failed: ${e.localizedMessage}", e)
+                _notificationMessage.value = "Import failed: ${e.localizedMessage}"
+            }
+        }
+    }
+
     fun toggleQuickTagOnRecentFlag(tag: BehaviorTag) {
         val current = _recentFlagState.value ?: return
         val updated = if (tag in current.selectedTags) {
@@ -623,11 +914,6 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    /**
-     * Handles "Jolt, wrong car" / "Cancel" / Undo tap:
-     *  1. If an encounter alert is active on screen and no flag was just created, suppresses the alert.
-     *  2. Otherwise deletes the most recent user BAD/ANGEL flag (if created within the last 5 minutes).
-     */
     fun undoLastAction(fromVoice: Boolean = false) {
         viewModelScope.launch {
             val recentFlag = _recentFlagState.value
@@ -641,6 +927,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
             val latest = dao.getLatestUserFlag()
             val now = System.currentTimeMillis()
             if (latest != null && now - latest.timestamp <= UNDO_MAX_AGE_MS) {
+                if (pendingPlateBackfill?.rowId == latest.id) {
+                    pendingPlateBackfill = null
+                }
                 deleteLogItem(latest)
                 _recentFlagState.value = null
                 recentFlagExpiryJob?.cancel()
@@ -863,6 +1152,9 @@ class DashcamViewModel(application: Application) : AndroidViewModel(application)
     companion object {
         private const val TAG = "DashcamViewModel"
         private const val SIGHTING_COOLDOWN_MS = 30_000L
+        private const val ENCOUNTER_DENOM_COOLDOWN_MS = 20_000L
+        private const val PARTIAL_MATCH_THROTTLE_MS = 1_500L
+        private const val FORWARD_BACKFILL_WINDOW_MS = 5_500L
         private const val HEALTH_SNAPSHOT_INTERVAL_MS = 15_000L
         private const val UNDO_MAX_AGE_MS = 5 * 60 * 1_000L
         private const val MPS_TO_MPH = 2.2369363f

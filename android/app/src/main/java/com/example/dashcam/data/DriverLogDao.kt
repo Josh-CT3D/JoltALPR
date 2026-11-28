@@ -5,8 +5,7 @@ import androidx.room.*
 import kotlinx.coroutines.flow.Flow
 
 /**
- * Data Access Object for Room database.
- * Facilitates asynchronous data insertions, deletions, and active standard query flows.
+ * Data Access Object for Room database (v7).
  */
 @Dao
 interface DriverLogDao {
@@ -16,36 +15,103 @@ interface DriverLogDao {
     @Query("SELECT * FROM driver_logs ORDER BY timestamp DESC")
     fun getAllLogs(): Flow<List<DriverLog>>
 
+    @Query("SELECT * FROM driver_logs ORDER BY timestamp DESC")
+    suspend fun getAllLogsSnapshot(): List<DriverLog>
+
     @Delete
     suspend fun deleteLogInternal(log: DriverLog)
 
     @Query("DELETE FROM driver_logs")
     suspend fun clearAllLogsInternal()
 
-    /**
-     * Known Bad Driver Alert lookup.
-     * Matches on the OCR-confusion-folded plate form (see normalizePlate) so O/0, I/1, B/8, S/5
-     * misreads still alert. Returns the most recent BAD-rated match, or null if never flagged.
-     * Called every time the OCR pipeline publishes a consensus plate.
-     */
     @Query("SELECT * FROM driver_logs WHERE plateNormalized = :normalizedPlate AND rating = 'BAD' ORDER BY timestamp DESC LIMIT 1")
     suspend fun findBadDriverByPlate(normalizedPlate: String): DriverLog?
 
-    /**
-     * Phase 2 Vehicle Reputation lookup: fetches all BAD, ANGEL, and SIGHTING rows for a
-     * normalized plate so [computeVehicleReputation] can compute cumulative severity, incident
-     * pips, and parallel Angel goodwill status.
-     */
     @Query("SELECT * FROM driver_logs WHERE plateNormalized = :normalizedPlate ORDER BY timestamp DESC")
     suspend fun findVehicleHistoryByPlate(normalizedPlate: String): List<DriverLog>
 
-    /** Updates behavior tags and severity on an existing incident (e.g. follow-up voice reason or quick-tag chip). */
+    /** Returns all user/peer incident rows ("BAD" and "ANGEL") for Tier 2/3 partial matching. */
+    @Query("SELECT * FROM driver_logs WHERE rating IN ('BAD', 'ANGEL') ORDER BY timestamp DESC")
+    suspend fun getAllIncidentCandidates(): List<DriverLog>
+
+    /** Updates behavior tags and severity on an existing incident. */
     @Query("UPDATE driver_logs SET behaviorTags = :behaviorTags, severity = :severity WHERE id = :id")
     suspend fun updateLogTagsAndSeverity(id: Long, behaviorTags: String?, severity: String?)
 
-    /** Fetches the most recent user-created incident ("BAD" or "ANGEL") for voice "wrong car" / "undo". */
+    /**
+     * Phase 2.1 Forward Plate Backfill: attaches a newly confirmed consensus plate + crop JPEG
+     * when a highway vehicle was voice-flagged 1–5s before its plate locked OCR consensus.
+     */
+    @Query(
+        "UPDATE driver_logs SET plateOcr = :plateOcr, plateNormalized = :plateNormalized, " +
+            "plateCropPath = COALESCE(:plateCropPath, plateCropPath), matchConfidence = :matchConfidence " +
+            "WHERE id = :id"
+    )
+    suspend fun backfillPlateOnRecentFlag(
+        id: Long,
+        plateOcr: String,
+        plateNormalized: String,
+        plateCropPath: String?,
+        matchConfidence: Float = 1.0f
+    )
+
+    /** Backfills structured appearance columns from legacy `vehicleMmc` / `notes` after v6->v7 upgrade. */
+    @Query(
+        "UPDATE driver_logs SET vehicleColor = :color, vehicleMake = :make, " +
+            "vehicleBodyStyle = :bodyStyle, vehicleMmc = :cleanSummary WHERE id = :id"
+    )
+    suspend fun updateStructuredAppearance(
+        id: Long,
+        color: String?,
+        make: String?,
+        bodyStyle: String?,
+        cleanSummary: String?
+    )
+
+    /** Full parked-review incident edit (Requirements §13 Correctability). */
+    @Query(
+        "UPDATE driver_logs SET plateOcr = :plateOcr, plateNormalized = :plateNormalized, " +
+            "vehicleMmc = :vehicleMmc, vehicleColor = :vehicleColor, vehicleMake = :vehicleMake, " +
+            "vehicleBodyStyle = :vehicleBodyStyle, behaviorTags = :behaviorTags, " +
+            "severity = :severity, notes = :notes WHERE id = :id"
+    )
+    suspend fun updateLogFullReview(
+        id: Long,
+        plateOcr: String?,
+        plateNormalized: String?,
+        vehicleMmc: String?,
+        vehicleColor: String?,
+        vehicleMake: String?,
+        vehicleBodyStyle: String?,
+        behaviorTags: String?,
+        severity: String?,
+        notes: String?
+    )
+
     @Query("SELECT * FROM driver_logs WHERE rating IN ('BAD', 'ANGEL') ORDER BY timestamp DESC LIMIT 1")
     suspend fun getLatestUserFlag(): DriverLog?
+
+    /** Deduplication check for Trusted-Group bundle import. */
+    @Query(
+        "SELECT COUNT(*) FROM driver_logs WHERE reporterId = :reporterId AND timestamp = :timestamp " +
+            "AND COALESCE(plateNormalized, '') = :plateNormOrEmpty"
+    )
+    suspend fun countMatchingImportedLog(reporterId: String, timestamp: Long, plateNormOrEmpty: String): Int
+
+    // --- Phase 3 Appearance Encounter Denominators ---
+    @Query("SELECT * FROM appearance_encounters")
+    fun getAllAppearanceEncounters(): Flow<List<AppearanceEncounter>>
+
+    @Query(
+        "SELECT * FROM appearance_encounters WHERE categoryType = :type AND categoryKey = :key LIMIT 1"
+    )
+    suspend fun getAppearanceEncounter(type: String, key: String): AppearanceEncounter?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertAppearanceEncounter(entry: AppearanceEncounter)
+
+    @Query("DELETE FROM appearance_encounters")
+    suspend fun clearAllAppearanceEncountersInternal()
 
     // --- Continuous GPS Breadcrumbs Location History ---
     @Insert(onConflict = OnConflictStrategy.REPLACE)
@@ -57,13 +123,28 @@ interface DriverLogDao {
     @Query("DELETE FROM location_history")
     suspend fun clearAllLocationRecordsInternal()
 
-    // Deletes breadcrumbs older than the given timestamp cutoff.
-    // Called periodically to keep the table from growing unbounded (17k rows/day at 5s interval).
     @Query("DELETE FROM location_history WHERE timestamp < :cutoffMs")
     suspend fun deleteLocationRecordsOlderThan(cutoffMs: Long)
 }
 
-// Extension functions or helper wrapper to enable unified, logging-aware database transactions
+suspend fun DriverLogDao.incrementEncounter(type: String, key: String, timestamp: Long) {
+    if (key.isBlank()) return
+    try {
+        val existing = getAppearanceEncounter(type, key)
+        val nextCount = (existing?.encounterCount ?: 0) + 1
+        upsertAppearanceEncounter(
+            AppearanceEncounter(
+                categoryType = type,
+                categoryKey = key,
+                encounterCount = nextCount,
+                lastSeenTimestamp = timestamp
+            )
+        )
+    } catch (e: Exception) {
+        Log.w("AppDatabase", "Encounter increment failed ($type/$key): ${e.localizedMessage}")
+    }
+}
+
 suspend fun DriverLogDao.safeInsertLog(log: DriverLog): Long {
     return try {
         val result = insertLogInternal(log)
@@ -87,7 +168,8 @@ suspend fun DriverLogDao.safeDeleteLog(log: DriverLog) {
 suspend fun DriverLogDao.safeClearAllLogs() {
     try {
         clearAllLogsInternal()
-        Log.w("AppDatabase", "WARNING: All DriverLogs successfully cleared from SQLite")
+        clearAllAppearanceEncountersInternal()
+        Log.w("AppDatabase", "WARNING: All DriverLogs and encounter counters cleared from SQLite")
     } catch (e: Exception) {
         Log.e("AppDatabase", "CRITICAL: Database clear transaction failed: ${e.localizedMessage}", e)
     }
@@ -112,4 +194,3 @@ suspend fun DriverLogDao.safeClearAllLocationRecords() {
         Log.e("AppDatabase", "CRITICAL: Failed to clear location history records: ${e.localizedMessage}", e)
     }
 }
-

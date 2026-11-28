@@ -6,6 +6,8 @@ import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.util.Log
+import com.ct3d.jolt.data.StructuredAppearance
+import com.ct3d.jolt.data.VehicleAppearance
 import org.tensorflow.lite.Interpreter
 import org.tensorflow.lite.gpu.GpuDelegate
 import java.io.FileInputStream
@@ -16,38 +18,37 @@ import java.nio.channels.FileChannel
 import kotlin.math.exp
 
 /**
- * Make/Model/Colour classifier — Phase 5 fallback for when the plate can't be read.
+ * Make/Body/Color Vehicle Appearance Classifier — Phase 5 + Phase 3 Upgraded.
  *
- * Model: EfficientNet-B0 fine-tuned on Stanford Cars (196 classes), trained locally on the
- * RTX 4060 Ti to 88.1% val top-1 and exported via litert-torch.
+ * Model: EfficientNet-B0 fine-tuned on Stanford Cars (196 classes) with highway-distance blur and
+ * scale-jitter augmentation on RTX 4060 Ti, fused with:
+ *  1. Marginalized `(Make, BodyStyle)` probability summation across all 196 softmax outputs (so
+ *     modern SUVs/Sedans/Pickups that split probability across trims still resolve cleanly without
+ *     emitting stale 1991–2012 trim years).
+ *  2. Zero-copy HSV dominant body-paint color estimation over the reused 224×224 pixel buffer.
  *
- * Input:  [1, 224, 224, 3] float32, NHWC — deliberately channel-LAST so the pixel loop here
- *         mirrors [YoloV8Detector]'s. Values must be ImageNet-normalised, NOT plain 0–1:
- *         the training transform was Resize(224,224) → ToTensor() → Normalize(mean, std).
- *         Getting this wrong doesn't crash, it just returns confident nonsense.
- * Output: [1, 196] raw logits (no softmax in-graph) → softmax here for a usable confidence.
- *
- * THREADING (R1): like [YoloV8Detector], the TFLite GPU delegate binds its EGL context to the
- * thread that builds the Interpreter, so initialize() AND every classify() call must happen on
- * TelephotoAnalyzer's single `jolt-pipeline` thread. Never call this from the ML Kit OCR callback
- * (that runs on the main thread) — dispatch back onto the pipeline dispatcher first.
+ * THREADING (R1): initialize() AND every classify() call MUST happen on `jolt-pipeline`.
  */
 class MmcClassifier(private val context: Context) {
 
-    data class Prediction(val label: String, val confidence: Float)
+    data class Prediction(
+        val label: String,
+        val confidence: Float,
+        val appearance: StructuredAppearance = StructuredAppearance()
+    )
 
     data class DetailedPrediction(
         val published: Prediction?,
         val top1Label: String,
         val top1Confidence: Float,
-        val top3Summary: String
+        val top3Summary: String,
+        val appearance: StructuredAppearance = StructuredAppearance()
     )
 
     private var interpreter: Interpreter? = null
     private var gpuDelegate: GpuDelegate? = null
     private var labels: List<String> = emptyList()
 
-    /** True once initialize() has run and the model+labels actually loaded. */
     @Volatile
     var isAvailable: Boolean = false
         private set
@@ -59,12 +60,9 @@ class MmcClassifier(private val context: Context) {
     private val inputSize = 224
     private val pixelSize = 3
 
-    // ImageNet normalisation — must match train_mmc.py's transforms.Normalize exactly.
     private val mean = floatArrayOf(0.485f, 0.456f, 0.406f)
     private val std  = floatArrayOf(0.229f, 0.224f, 0.225f)
 
-    // Reusable scratch, allocated once (A3 pattern) — avoids ~1MB of per-frame churn.
-    // Guarded by @Synchronized on initialize/classify/close.
     private lateinit var inputBuffer: ByteBuffer
     private lateinit var intValues: IntArray
     private lateinit var outputBuffer: Array<FloatArray>
@@ -73,12 +71,6 @@ class MmcClassifier(private val context: Context) {
     private val resizeMatrix = Matrix()
     private val resizePaint = Paint(Paint.FILTER_BITMAP_FLAG)
 
-    /**
-     * Load model + labels. Safe to call when the assets are absent: `mmc_classifier.tflite` is
-     * gitignored ("large binaries, distribute separately"), so a fresh clone legitimately won't
-     * have it. In that case we log and leave [isAvailable] false rather than throwing — the app
-     * then behaves exactly as it did pre-Phase-5 instead of crashing on launch.
-     */
     @Synchronized
     fun initialize() {
         try {
@@ -95,15 +87,11 @@ class MmcClassifier(private val context: Context) {
 
             val outShape = interpreter!!.getOutputTensor(0).shape()
             val inShape  = interpreter!!.getInputTensor(0).shape()
-            Log.i(TAG, "MMC input ${inShape.contentToString()} output ${outShape.contentToString()}, " +
-                       "${labels.size} labels")
+            Log.i(TAG, "MMC input ${inShape.contentToString()} output ${outShape.contentToString()}, ${labels.size} labels")
 
-            // Fail loudly on a model/label mismatch rather than silently mislabelling every
-            // prediction (e.g. re-exported with a different class count).
             val numClasses = outShape.last()
             if (numClasses != labels.size) {
-                Log.e(TAG, "Model outputs $numClasses classes but $LABELS_ASSET has ${labels.size} " +
-                           "— refusing to load (labels would be wrong).")
+                Log.e(TAG, "Model outputs $numClasses classes but $LABELS_ASSET has ${labels.size} — refusing to load.")
                 interpreter?.close(); interpreter = null
                 gpuDelegate?.close(); gpuDelegate = null
                 return
@@ -118,16 +106,12 @@ class MmcClassifier(private val context: Context) {
 
             isAvailable = true
             Log.i(TAG, "MmcClassifier initialized successfully")
-
         } catch (e: Exception) {
-            // Most likely cause: mmc_classifier.tflite not present in assets.
-            Log.w(TAG, "MMC unavailable (${e.javaClass.simpleName}: ${e.message}) — " +
-                       "plate OCR still works, MMC fallback disabled")
+            Log.w(TAG, "MMC unavailable (${e.javaClass.simpleName}: ${e.message}) — plate OCR still works")
             isAvailable = false
         }
     }
 
-    /** GPU delegate first, CPU fallback — same wrapping rationale as YoloV8Detector.A1. */
     private fun createInterpreter(modelBuffer: MappedByteBuffer): Interpreter {
         try {
             val delegate = GpuDelegate(GpuDelegate.Options().apply { setPrecisionLossAllowed(true) })
@@ -147,19 +131,13 @@ class MmcClassifier(private val context: Context) {
         return cpuInterpreter
     }
 
-    /**
-     * Classify a vehicle image. Returns null when the model isn't loaded, inference fails, or the
-     * top-1 softmax confidence is below [minConfidence] — callers treat null as "no MMC to show".
-     *
-     * MUST run on the `jolt-pipeline` thread (see class kdoc).
-     */
     @Synchronized
     fun classify(bitmap: Bitmap, minConfidence: Float = MIN_MMC_CONFIDENCE): Prediction? =
         classifyDetailed(bitmap, minConfidence)?.published
 
     /**
-     * Same as [classify], but also returns the top-1/top-3 score breakdown even when below
-     * [minConfidence] so field telemetry can evaluate O9 crop accuracy and tune the confidence floor.
+     * Runs EfficientNet-B0 on `jolt-pipeline`, marginalizes `(Make, BodyStyle)` probabilities,
+     * and extracts dominant HSV body color from the same `224×224` pixel buffer.
      */
     @Synchronized
     fun classifyDetailed(bitmap: Bitmap, minConfidence: Float = MIN_MMC_CONFIDENCE): DetailedPrediction? {
@@ -176,26 +154,41 @@ class MmcClassifier(private val context: Context) {
             val logits = outputBuffer[0]
             val probs = softmax(logits)
 
+            // Zero-copy HSV color extraction over the already-populated 224×224 intValues buffer
+            val paintColor = VehicleAppearance.estimateBodyColorFromPixels(intValues, inputSize, inputSize)
+            val appearance = VehicleAppearance.fuseMmcProbabilitiesAndColor(labels, probs, paintColor)
+
             val top3 = probs.indices.sortedByDescending { probs[it] }.take(3)
             val summary = top3.joinToString("; ") {
                 "${displayLabel(labels[it])}=${"%.3f".format(probs[it])}"
             }
-            Log.d(TAG, "MMC top3: $summary")
+            Log.d(TAG, "MMC top3: $summary | structured=${appearance.formatSummary()} (mk=${"%.2f".format(appearance.makeConfidence)}, bd=${"%.2f".format(appearance.bodyConfidence)}, col=${"%.2f".format(appearance.colorConfidence)})")
 
             val bestIdx = top3.first()
-            val bestLabel = displayLabel(labels[bestIdx])
-            val confidence = probs[bestIdx]
-            val published = if (confidence < minConfidence) {
-                Log.d(TAG, "MMC below floor ($confidence < $minConfidence) — no fallback shown")
-                null
+            val bestRawLabel = displayLabel(labels[bestIdx])
+            val top1Confidence = probs[bestIdx]
+
+            // Publish clean modern summary ("White Honda SUV" or "Silver SUV") whenever either:
+            //  (a) top-1 class >= minConfidence (0.25), OR
+            //  (b) marginalized BodyStyle probability is strong (>= 0.42) with Make or Color!
+            val effectiveConf = maxOf(top1Confidence, appearance.bodyConfidence * 0.85f)
+            val allowMarginalFallback = minConfidence <= MIN_MMC_CONFIDENCE
+            val hasModernSummary = allowMarginalFallback && appearance.bodyStyle != null &&
+                (appearance.make != null || (appearance.color != null && appearance.bodyConfidence >= 0.42f))
+
+            val published = if (top1Confidence >= minConfidence || (hasModernSummary && appearance.bodyConfidence >= 0.42f)) {
+                val cleanLabel = appearance.formatSummary() ?: bestRawLabel
+                Prediction(label = cleanLabel, confidence = effectiveConf, appearance = appearance)
             } else {
-                Prediction(bestLabel, confidence)
+                null
             }
+
             DetailedPrediction(
                 published = published,
-                top1Label = bestLabel,
-                top1Confidence = confidence,
-                top3Summary = summary
+                top1Label = bestRawLabel,
+                top1Confidence = top1Confidence,
+                top3Summary = summary,
+                appearance = appearance
             )
         } catch (e: Exception) {
             Log.e(TAG, "MMC inference failed: ${e.message}", e)
@@ -203,11 +196,21 @@ class MmcClassifier(private val context: Context) {
         }
     }
 
-    /**
-     * Scale into the reused 224×224 bitmap, then fill the input buffer NHWC with ImageNet-
-     * normalised floats. Mirrors train_mmc.py's val transform: a plain Resize to a square
-     * (aspect ratio is intentionally NOT preserved — that's how the model was trained).
-     */
+    /** Fast color-only estimation when OCR succeeded and full MMC TFLite isn't needed. */
+    @Synchronized
+    fun estimateColorOnly(bitmap: Bitmap): Pair<String?, Float> {
+        if (bitmap.isRecycled) return null to 0f
+        return try {
+            val w = bitmap.width
+            val h = bitmap.height
+            val px = IntArray(w * h)
+            bitmap.getPixels(px, 0, w, 0, 0, w, h)
+            VehicleAppearance.estimateBodyColorFromPixels(px, w, h)
+        } catch (_: Exception) {
+            null to 0f
+        }
+    }
+
     private fun preprocess(bitmap: Bitmap) {
         resizeMatrix.reset()
         resizeMatrix.setScale(inputSize.toFloat() / bitmap.width, inputSize.toFloat() / bitmap.height)
@@ -229,7 +232,6 @@ class MmcClassifier(private val context: Context) {
         }
     }
 
-    /** Numerically-stable softmax (subtract max before exp). */
     private fun softmax(logits: FloatArray): FloatArray {
         val max = logits.max()
         var sum = 0f
@@ -243,49 +245,31 @@ class MmcClassifier(private val context: Context) {
         return out
     }
 
-    /** "Chevrolet_Express_Van_2007" -> "Chevrolet Express Van 2007" for on-screen display. */
     private fun displayLabel(raw: String): String = raw.replace('_', ' ')
 
-    // C5: close the AssetFileDescriptor too, not just the stream — the mapping stays valid after
-    // both are closed, so there's nothing to keep open.
-    private fun loadModelFile(filename: String): MappedByteBuffer {
-        context.assets.openFd(filename).use { fd ->
-            FileInputStream(fd.fileDescriptor).use { input ->
-                return input.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+    private fun loadModelFile(assetName: String): MappedByteBuffer {
+        return context.assets.openFd(assetName).use { fd ->
+            FileInputStream(fd.fileDescriptor).use { fis ->
+                fis.channel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
             }
         }
     }
 
     @Synchronized
     fun close() {
+        isAvailable = false
+        isUsingGpuDelegate = false
         interpreter?.close()
         interpreter = null
         gpuDelegate?.close()
         gpuDelegate = null
-        if (::resizedBitmap.isInitialized && !resizedBitmap.isRecycled) resizedBitmap.recycle()
-        isAvailable = false
-        isUsingGpuDelegate = false
         Log.i(TAG, "MmcClassifier closed")
     }
 
     companion object {
         private const val TAG = "MmcClassifier"
-        private const val MODEL_ASSET  = "mmc_classifier.tflite"
+        private const val MODEL_ASSET = "mmc_classifier.tflite"
         private const val LABELS_ASSET = "mmc_class_names.txt"
-
-        /**
-         * Top-1 softmax floor for showing an MMC guess.
-         *
-         * Lowered 0.35 → 0.25 (O9/F2). Two reasons the original was mis-calibrated:
-         *  1. 196 fine-grained classes spread probability across near-identical trims.
-         *  2. train_mmc.py trains with `CrossEntropyLoss(label_smoothing=0.1)`, which by
-         *     construction stops the model ever becoming very peaky — measured ceiling on a
-         *     *known training image filling the frame* was only 0.32–0.49. A 0.35 floor was
-         *     therefore demanding near-best-case confidence just to show anything.
-         *
-         * A wrong "Toyota Camry 2011" is cheap; a fallback that never fires is the failure mode
-         * we're actually avoiding. Re-tune from the "MMC top3" logs after a real drive.
-         */
         const val MIN_MMC_CONFIDENCE = 0.25f
     }
 }
